@@ -1,0 +1,31 @@
+[project]
+name = "voice-fep"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "S", "B"]
+ignore = [
+    "S603",   # subprocess with shell=False is fine
+    "S607",   # partial path in subprocess is fine
+    "B008",   # function call in default arg — pynput patterns
+]
+# Bandit rules mapped to ruff S-codes are checked here; run bandit separately for full scan
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]  # assert is fine in tests
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+markers = [
+    "integration: marks tests that call real APIs (deselect with -m 'not integration')",
+]
+
+[tool.bandit]
+exclude_dirs = [".venv", "tests"]
+skips = ["B404", "B603"]  # subprocess usage in run_silent.vbs watcher is not in Python

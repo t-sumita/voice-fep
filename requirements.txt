@@ -1,0 +1,21 @@
+# Audio recording
+sounddevice>=0.4.6
+scipy>=1.11.0
+numpy>=1.26.0
+
+# Gemini API (primary backend)
+google-genai>=0.8.0
+
+# Clipboard & window automation
+pyperclip>=1.8.2
+pyautogui>=0.9.54
+pynput>=1.7.6
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Optional: Cloudflare Workers AI (fallback)
+# httpx>=0.27.0  # uncomment if using cloudflare backend
+
+# Optional: Local Whisper (offline fallback)
+# faster-whisper>=1.0.0  # uncomment if using local_whisper backend
