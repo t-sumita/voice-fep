@@ -148,6 +148,55 @@ class TestPasteText:
         assert call_order[-1] == ""
 
 
+class TestAudioCaptureSpec:
+    """Verify 16kHz / mono / int16 settings are locked in source."""
+
+    def _src(self) -> str:
+        return (Path(__file__).parent.parent / "main.py").read_text(encoding="utf-8")
+
+    def test_sample_rate_constant_is_16k(self):
+        assert main.SAMPLE_RATE == 16000
+
+    def test_inputstream_uses_sample_rate_constant(self):
+        assert "samplerate=SAMPLE_RATE" in self._src()
+
+    def test_inputstream_is_mono(self):
+        assert "channels=1" in self._src()
+
+    def test_inputstream_dtype_is_int16(self):
+        assert 'dtype="int16"' in self._src()
+
+
+class TestTimingLog:
+    """Verify transcription timing is measured and logged."""
+
+    def test_timing_log_emitted(self, monkeypatch, caplog):
+        import logging
+        monkeypatch.setattr(main, "_audio_chunks", [])
+        monkeypatch.setattr(main, "_stream", None)
+        # stop_recording returns None → _process_and_paste exits early (no API call)
+        # Use a stub that injects wav bytes to exercise the timing path
+        wav = _make_wav_bytes()
+        monkeypatch.setattr(main, "stop_recording", lambda: wav)
+        monkeypatch.setattr(main, "transcribe", lambda _: "テスト")
+        monkeypatch.setattr(main.pyperclip, "copy", lambda _: None)
+        monkeypatch.setattr(main.pyautogui, "hotkey", lambda *_: None)
+
+        class _FakeIndicator:
+            def safe_set_state(self, _): pass
+
+        with caplog.at_level(logging.INFO, logger="voice-fep"):
+            main._process_and_paste(_FakeIndicator())
+
+        timing_lines = [r for r in caplog.records if "transcription took" in r.message]
+        assert timing_lines, "No 'transcription took' log line emitted"
+        # Value must be a parseable float (seconds)
+        import re
+        m = re.search(r"([\d.]+)s", timing_lines[0].message)
+        assert m, f"Could not parse elapsed time from: {timing_lines[0].message}"
+        assert float(m.group(1)) >= 0
+
+
 class TestSecurityInSource:
     def test_no_hardcoded_api_key_pattern(self):
         """S-1: scan main.py for hardcoded key patterns."""

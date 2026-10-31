@@ -19,7 +19,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION: str = "0.2.0"
+APP_VERSION: str = "0.2.1"
 GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 BACKEND: str = os.environ.get("BACKEND", "gemini")
@@ -50,6 +50,11 @@ SYSTEM_PROMPT = (
     "- 英略語・固有名詞はアルファベット表記にする（例: API, GitHub, .env, CI/CD, URL, HTTP）。\n"
     "- カタカナIT用語は正確に表記する（例: 'くらうど' → 'クラウド'、'ぷるりく' → 'プルリク'）。\n"
     "- コマンド・ファイル名・コード片はそのまま出力する（例: git commit, main.py）。\n"
+    "\n"
+    "【分かち書き禁止】\n"
+    "- 日本語を出力する際は、単語間に半角スペース・全角スペース・空白を一切挟まない。\n"
+    "- 「これ まだ バージョン が 上がっ て ない の ?」のような分かち書き形式は厳禁。\n"
+    "- 通常の自然な日本語の文として続けて出力すること。\n"
 )
 
 # ---------------------------------------------------------------------------
@@ -268,13 +273,16 @@ def _on_release(key, indicator: Indicator):
 
 
 def _process_and_paste(indicator: Indicator):
+    import time  # noqa: PLC0415
     try:
         wav_bytes = stop_recording()
         if not wav_bytes:
             indicator.safe_set_state("idle")
             return
+        t0 = time.perf_counter()
         text = transcribe(wav_bytes)
-        log.info("transcribed %d chars", len(text))
+        elapsed = time.perf_counter() - t0
+        log.info("transcription took %.2fs, %d chars", elapsed, len(text))
         if text:
             paste_text(text)
         indicator.safe_set_state("idle")

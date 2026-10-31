@@ -45,6 +45,10 @@ class TestSystemPrompt:
         assert "API" in main.SYSTEM_PROMPT
         assert "GitHub" in main.SYSTEM_PROMPT
 
+    def test_no_word_spacing_rule(self):
+        """Prompt must prohibit wakati-gaki (space-separated Japanese output)."""
+        assert "分かち書き" in main.SYSTEM_PROMPT
+
 
 class TestConfig:
     def test_sample_rate_is_16k(self):
@@ -52,7 +56,7 @@ class TestConfig:
 
     def test_app_version_defined(self):
         assert hasattr(main, "APP_VERSION")
-        assert main.APP_VERSION == "0.2.0"
+        assert main.APP_VERSION == "0.2.1"
 
     def test_default_backend_is_gemini(self, monkeypatch):
         monkeypatch.delenv("BACKEND", raising=False)
