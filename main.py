@@ -19,7 +19,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION: str = "0.1.0"
+APP_VERSION: str = "0.2.0"
 GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 BACKEND: str = os.environ.get("BACKEND", "gemini")
@@ -30,15 +30,26 @@ HOTKEY = keyboard.Key.f8
 # Transcription prompt  — edit here to tune output style
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = (
-    "あなたは日本語音声の書き起こし専門アシスタントです。\n"
-    "以下のルールを厳守してください。\n"
-    "- 挨拶・返答・確認・説明は一切出力しない。\n"
-    "- 書き起こしテキストのみを返す。\n"
-    "- 言い淀み（「えーと」「あの」「まあ」等）は除去する。\n"
-    "- 文脈から適切な漢字・熟語に変換する（例: 'きょねん' → '去年'）。\n"
-    "- 助詞・接続詞の補正を行い自然な日本語にする。\n"
-    "- 専門用語は文脈から推定して正確に表記する（例: 'くらうど' → 'クラウド'）。\n"
-    "- 出力はテキストのみ。余分な記号・括弧・マークダウン不要。"
+    "あなたは日本語音声書き起こし専用エンジンです。以下のルールを絶対に守ってください。\n"
+    "\n"
+    "【出力ルール】\n"
+    "- 書き起こし本文のみを出力する。\n"
+    "- 前置き・挨拶・返答・説明・「書き起こし結果:」等は一切含めない。\n"
+    "- マークダウン記法（**太字**、# 見出し等）・余分な括弧・記号は使わない。\n"
+    "\n"
+    "【フィラー・言い淀みの除去】\n"
+    "- 「あー」「えー」「えーと」「あの」「まあ」「うーん」「なんか」「そのー」等のフィラーは削除する。\n"
+    "- 言い直し（「〜じゃなくて、〜」「〜いや、〜」）は最終的な表現だけを残す。\n"
+    "\n"
+    "【漢字・語彙の最適化】\n"
+    "- 同音異義語は文脈から最適な漢字に変換する（例: 'きかい' → 文脈に応じて「機械」「機会」）。\n"
+    "- 話し言葉は自然な書き言葉に整える（例: 'やっぱり' → 'やはり'）。\n"
+    "- 助詞・接続詞を補完し、読みやすい文にする。\n"
+    "\n"
+    "【IT・プログラミング用語の正規化】\n"
+    "- 英略語・固有名詞はアルファベット表記にする（例: API, GitHub, .env, CI/CD, URL, HTTP）。\n"
+    "- カタカナIT用語は正確に表記する（例: 'くらうど' → 'クラウド'、'ぷるりく' → 'プルリク'）。\n"
+    "- コマンド・ファイル名・コード片はそのまま出力する（例: git commit, main.py）。\n"
 )
 
 # ---------------------------------------------------------------------------
@@ -268,7 +279,7 @@ def _process_and_paste(indicator: Indicator):
             paste_text(text)
         indicator.safe_set_state("idle")
     except Exception as exc:
-        log.error("error during transcription: %s", type(exc).__name__)
+        log.error("error during transcription: %s: %s", type(exc).__name__, exc)
         indicator.safe_set_state("error")
         threading.Timer(3.0, lambda: indicator.safe_set_state("idle")).start()
 

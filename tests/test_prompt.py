@@ -27,10 +27,23 @@ class TestSystemPrompt:
         assert "挨拶" in main.SYSTEM_PROMPT
 
     def test_filler_removal_rule(self):
-        assert "言い淀み" in main.SYSTEM_PROMPT
+        assert "フィラー" in main.SYSTEM_PROMPT
+
+    def test_filler_examples_covered(self):
+        """Prompt must name concrete filler words so the model has clear targets."""
+        for filler in ("あー", "えーと", "うーん"):
+            assert filler in main.SYSTEM_PROMPT, f"Filler '{filler}' not in SYSTEM_PROMPT"
 
     def test_no_markdown_rule(self):
         assert "マークダウン" in main.SYSTEM_PROMPT
+
+    def test_no_preamble_rule(self):
+        assert "書き起こし結果" in main.SYSTEM_PROMPT
+
+    def test_it_terminology_rule(self):
+        """Prompt must instruct accurate IT/programming term rendering."""
+        assert "API" in main.SYSTEM_PROMPT
+        assert "GitHub" in main.SYSTEM_PROMPT
 
 
 class TestConfig:
@@ -39,7 +52,7 @@ class TestConfig:
 
     def test_app_version_defined(self):
         assert hasattr(main, "APP_VERSION")
-        assert main.APP_VERSION == "0.1.0"
+        assert main.APP_VERSION == "0.2.0"
 
     def test_default_backend_is_gemini(self, monkeypatch):
         monkeypatch.delenv("BACKEND", raising=False)
@@ -52,4 +65,26 @@ class TestConfig:
         import importlib
         importlib.reload(main)
         assert "gemini" in main.GEMINI_MODEL.lower()
+
+
+class TestGeminiConfig:
+    """Verify Gemini config is minimal and error logging is detailed."""
+
+    def _src(self) -> str:
+        return (Path(__file__).parent.parent / "main.py").read_text(encoding="utf-8")
+
+    def test_no_thinking_config_in_source(self):
+        """thinking_config causes 400 on models that don't support it — must be absent."""
+        assert "thinking_config" not in self._src()
+        assert "ThinkingConfig" not in self._src()
+
+    def test_no_afc_config_in_source(self):
+        """AutomaticFunctionCallingConfig caused 400 on some models — must be absent."""
+        assert "AutomaticFunctionCallingConfig" not in self._src()
+
+    def test_error_log_includes_exception_detail(self):
+        """ClientError message must be logged so root cause is immediately visible."""
+        src = self._src()
+        # Verify the error log emits both type name and str(exc), not just type name
+        assert "type(exc).__name__, exc" in src
 

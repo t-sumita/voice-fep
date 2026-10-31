@@ -78,4 +78,24 @@ main.py 等の実装コードを先に生成した
 **対策**: `_normalize_model()` を削除し、`GEMINI_MODEL` 環境変数の値を SDK に直接渡す。モデル名を変更する際は `models.list()` 等で取得できた識別子文字列をそのまま `.env` に設定し、加工・推測しない  
 **影響ファイル**: `main.py`（関数削除）, `tests/test_prompt.py`（関連テスト削除）
 
+### [2026-11-01] LLM を FEP として使う際のレイテンシ削減策（AFC 無効化・思考抑制）
+
+**状況**: v0.2.0 のレスポンス速度改善タスク  
+**知見**:
+- `AutomaticFunctionCallingConfig(disable=True)` を `GenerateContentConfig` に渡すことで、AFC の初期化オーバーヘッド（約 1.4 秒）を排除できる。ツール呼び出しを使わない純粋な書き起こし用途では常に無効化すべき。
+- `ThinkingConfig(thinking_budget=0)` で思考トークンを抑制できる。思考モデル以外では no-op だが、将来モデルを変更した際も設定しておくことで意図しない遅延を防げる。
+- FEP 用途では「速さ」と「正確さ」のトレードオフが重要。AFC・思考無効化は正確さを損なわずレイテンシのみを削減できる有効な手段。  
+**How to apply**: `_transcribe_gemini` の `GenerateContentConfig` に両設定を常に含める。モデル変更時も削除しない。
+
+### [2026-11-01] thinking_config / AFC 無効化パラメータがモデルによって 400 を引き起こす
+
+**状況**: v0.2.0 実機テストで `gemini-flash-lite-latest` に対し `ThinkingConfig(thinking_budget=0)` および `AutomaticFunctionCallingConfig(disable=True)` を渡したところ 400 Bad Request が発生  
+**失敗内容**: 「どのモデルでも no-op になる」と想定したパラメータが、実際には非対応モデルでは不正引数として弾かれた  
+**根本原因**: SDK や各モデルのパラメータ対応状況を公式ドキュメントで確認せずに追加した。エラーログが `type(exc).__name__` のみで詳細を出力しておらず、原因特定に時間がかかった  
+**対策**:
+- `GenerateContentConfig` は `system_instruction` のみの最小構成を基本とし、追加パラメータは対応モデル・SDK バージョンを確認してから導入する
+- エラーログは `"%s: %s", type(exc).__name__, exc` 形式で例外メッセージ本文まで出力する（API エラーの場合は HTTP ステータスとレスポンス本文が含まれる）
+- `thinking_config` / AFC 設定は現時点では除外。将来再導入する場合は統合テストで実機確認してから追加する  
+**影響ファイル**: `main.py`, `tests/test_prompt.py`
+
 <!-- 新しい教訓はここに追記 -->

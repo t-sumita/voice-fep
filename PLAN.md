@@ -41,35 +41,46 @@
 
 ## フェーズ 3: テスト基盤（完了）
 
-- [x] `tests/test_prompt.py` — 9件 PASSED
-- [x] `tests/test_backend_stub.py` — 17件 PASSED（合計 26/26）
+- [x] `tests/test_prompt.py` — 10件 PASSED
+- [x] `tests/test_backend_stub.py` — 17件 PASSED（合計 27/27）
 - [x] `pyproject.toml` — pytest + ruff + bandit 設定
 - [x] `ruff check` — All checks passed
 - [x] `bandit -r main.py` — No issues identified
 
 ---
 
-## フェーズ 4: 動作確認
+## フェーズ 4: 動作確認（完了）
 
-- [ ] `.venv` + `pip install -r requirements.txt` が正常完了するか確認
-- [ ] F8 押下 → 録音開始（インジケータ●）が確認できるか
-- [ ] F8 解放 → Gemini API 送信 → テキストペーストが確認できるか
-- [ ] ペースト後クリップボードがクリアされるか確認
-- [ ] `run_silent.vbs` でコンソールなし起動が動作するか確認
-- [ ] エラー時にインジケータが × を 3 秒表示して ○ に戻るか確認
-
----
-
-## フェーズ 5: 初回コミット（人間が実行）
-
-- [ ] `git add` — コミット対象ファイルの確認（`.env` が含まれていないこと）
-- [ ] `git commit` — 人間が実行・メッセージ確認
-- [ ] リモートリポジトリの作成（GitHub）
-- [ ] `git push` — 人間が実行
+- [x] `.venv` + `pip install -r requirements.txt` が正常完了するか確認
+- [x] F8 押下 → 録音開始（インジケータ●）が確認できるか
+- [x] F8 解放 → Gemini API 送信 → テキストペーストが確認できるか
+- [x] ペースト後クリップボードがクリアされるか確認
+- [x] `run_silent.vbs` でコンソールなし起動が動作するか確認
+- [x] エラー時にインジケータが × を 3 秒表示して ○ に戻るか確認
 
 ---
 
-## 将来フェーズ（v0.2 以降）
+## フェーズ 5: 初回コミット（完了）
+
+- [x] `git add` — コミット対象ファイルの確認（`.env` が含まれていないこと）
+- [x] `git commit` — 人間が実行・メッセージ確認
+- [x] リモートリポジトリの作成（GitHub）
+- [x] `git push` — 人間が実行
+
+---
+
+## v0.2.0: レイテンシ削減・FEP 精度強化（完了）
+
+- [x] `APP_VERSION` を `"0.2.0"` に更新
+- [x] AFC 無効化（`AutomaticFunctionCallingConfig(disable=True)`）— 約 1.4s オーバーヘッド排除
+- [x] 思考トークン抑制（`ThinkingConfig(thinking_budget=0)`）— 非思考モデルでは no-op
+- [x] `SYSTEM_PROMPT` 強化: フィラー削除・同音異義語最適化・IT 用語正規化・前置き禁止
+- [x] テスト 32 件 PASSED（`TestGeminiLatencyConfig` 2 件追加）
+- [x] `LESSONS_LEARNED.md` に AFC/思考抑制の知見を記録
+
+---
+
+## 将来フェーズ（v0.3 以降）
 
 - [ ] 言語切替（英語対応）
 - [ ] 録音時間上限設定（RECORD_MAX_SEC）
