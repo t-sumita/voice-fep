@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """voice-fep: Windows常駐型 音声入力FEPツール (F8 トグル録音 → Gemini 書き起こし → 自動ペースト)"""
 
+import argparse
 import io
+import json
 import logging
+import math
 import os
+import sys
 import threading
+from pathlib import Path
 
 import numpy as np
 import pyautogui
@@ -15,16 +20,74 @@ from pynput import keyboard
 from scipy.io import wavfile
 
 load_dotenv()
+# When running as a frozen exe, also load .env from the exe's directory
+if getattr(sys, "frozen", False):
+    load_dotenv(Path(sys.executable).parent / ".env", override=False)
+
+# ---------------------------------------------------------------------------
+# Hotkey parser  (runs at module load to resolve HOTKEY / DICT_HOTKEY)
+# ---------------------------------------------------------------------------
+_MODIFIER_MAP: dict = {
+    "ctrl":    frozenset({keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r}),
+    "control": frozenset({keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r}),
+    "shift":   frozenset({keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r}),
+    "alt":     frozenset({keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r}),
+}
+
+
+def _parse_hotkey(spec: str):
+    """Parse 'ctrl+space' → (trigger Key, modifier frozenset)."""
+    parts = [p.strip().lower() for p in spec.split("+")]
+    mods: set = set()
+    trigger = None
+    for part in parts:
+        if part in _MODIFIER_MAP:
+            mods |= _MODIFIER_MAP[part]
+        else:
+            try:
+                trigger = getattr(keyboard.Key, part)
+            except AttributeError:
+                trigger = keyboard.KeyCode.from_char(part)
+    return trigger, frozenset(mods)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _get_exe_dir() -> Path:
+    """Return directory of the executable (frozen) or this source file (dev)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+
+def _get_log_path() -> Path:
+    """Return the log file path (next to exe when frozen, else in APPDATA/voice-fep/)."""
+    if getattr(sys, "frozen", False):
+        return _get_exe_dir() / "voice-fep.log"
+    appdata = os.environ.get("APPDATA", "")
+    base = Path(appdata) if appdata else Path.home() / ".config"
+    return base / "voice-fep" / "voice-fep.log"
+
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION: str = "0.2.1"
+APP_VERSION: str = "0.8.1"
 GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 BACKEND: str = os.environ.get("BACKEND", "gemini")
+WHISPER_MODEL: str = os.environ.get("WHISPER_MODEL", "base")
+try:
+    RECORD_MAX_SEC: int = max(1, int(float(os.environ.get("RECORD_MAX_SEC", "30") or "30")))
+except (ValueError, TypeError):
+    RECORD_MAX_SEC = 30
 SAMPLE_RATE: int = 16000
-HOTKEY = keyboard.Key.f8
+HOTKEY: str = os.environ.get("HOTKEY", "ctrl+space")
+DICT_HOTKEY: str = os.environ.get("DICT_HOTKEY", "shift+space")
+_RECORD_KEY, _RECORD_MODS = _parse_hotkey(HOTKEY)
+_DICT_KEY, _DICT_MODS = _parse_hotkey(DICT_HOTKEY)
+_ALL_MOD_KEYS: frozenset = _RECORD_MODS | _DICT_MODS
 
 # ---------------------------------------------------------------------------
 # Transcription prompt  — edit here to tune output style
@@ -51,6 +114,10 @@ SYSTEM_PROMPT = (
     "- カタカナIT用語は正確に表記する（例: 'くらうど' → 'クラウド'、'ぷるりく' → 'プルリク'）。\n"
     "- コマンド・ファイル名・コード片はそのまま出力する（例: git commit, main.py）。\n"
     "\n"
+    "【句読点】\n"
+    "- 文末には必ず自然な句点（。）を付与する。\n"
+    "- 文中の区切りにも適切に読点（、）を補完すること。\n"
+    "\n"
     "【分かち書き禁止】\n"
     "- 日本語を出力する際は、単語間に半角スペース・全角スペース・空白を一切挟まない。\n"
     "- 「これ まだ バージョン が 上がっ て ない の ?」のような分かち書き形式は厳禁。\n"
@@ -60,34 +127,88 @@ SYSTEM_PROMPT = (
 # ---------------------------------------------------------------------------
 # Logging  — audio content is NEVER written to logs
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("voice-fep")
+
+
+def _setup_logging() -> None:
+    """Adjust log level and add RotatingFileHandler if ENABLE_LOG_FILE is true.
+
+    Called once from main() so test imports don't create log files.
+    """
+    from logging.handlers import RotatingFileHandler  # noqa: PLC0415
+    level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.getLogger().setLevel(level)
+    log.setLevel(level)
+    if os.environ.get("ENABLE_LOG_FILE", "true").lower() not in ("true", "1", "yes"):
+        return
+    log_path = _get_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=1, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.getLogger().addHandler(fh)
+    log.info("Log file: %s", log_path)
 
 # ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
-_active = False          # True while F8 is held and recording
+_active = False               # True while trigger key is held and recording
+_blocked_until_release = False  # True after auto-stop; blocks key-repeat from restarting
+_pasting = False              # True during clipboard write + Ctrl+V; blocks spurious recording
+_mods_held: set = set()       # currently depressed modifier keys (ctrl/shift/alt variants)
 _audio_chunks: list = []
 _stream: sd.InputStream | None = None
+_record_timer: threading.Timer | None = None
 _lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Window state (position persistence)
+# ---------------------------------------------------------------------------
+def _get_config_path() -> Path:
+    appdata = os.environ.get("APPDATA", "")
+    base = Path(appdata) if appdata else Path.home() / ".config"
+    return base / "voice-fep" / "config.json"
+
+
+def _load_window_pos() -> tuple[int, int] | None:
+    path = _get_config_path()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return int(data["window_x"]), int(data["window_y"])
+    except Exception:
+        return None
+
+
+def _save_window_pos(x: int, y: int) -> None:
+    path = _get_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"window_x": x, "window_y": y}), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
 # Indicator UI (tkinter floating window, top-right corner)
 # ---------------------------------------------------------------------------
+# Precomputed sinusoidal wave frames: 8 frames × 4 bars, heights in [6, 28]
+_WAVE_FRAMES: list[list[int]] = [
+    [max(6, int(14 + 14 * math.sin(2 * math.pi * i / 8 + math.pi / 2 * j)))
+     for j in range(4)]
+    for i in range(8)
+]
+
 try:
     import tkinter as tk
 
     class Indicator(tk.Tk):
-        _STATES = {
-            "idle":       ("○", "#888888"),
-            "recording":  ("●", "#e53935"),
-            "processing": ("◎", "#fbc02d"),
-            "error":      ("×", "#f57c00"),
-        }
+        _W = 72
+        _H = 72
+        _N_BARS = 4
+        _BAR_W = 6
+        _BAR_GAP = 4
+        _WAVE_MS = 120
 
         def __init__(self):
             super().__init__()
@@ -95,36 +216,117 @@ try:
             self.attributes("-topmost", True)
             self.attributes("-alpha", 0.85)
             self.configure(bg="#1e1e1e")
-            sw = self.winfo_screenwidth()
-            self.geometry(f"72x72+{sw - 84}+8")
 
-            self._canvas = tk.Canvas(self, width=72, height=72, bg="#1e1e1e", highlightthickness=0)
-            self._canvas.pack()
-            self._item = self._canvas.create_text(
-                36, 36, text="○", fill="#888888",
-                font=("Segoe UI Symbol", 30, "bold"),
+            pos = _load_window_pos()
+            if pos:
+                self.geometry(f"{self._W}x{self._H}+{pos[0]}+{pos[1]}")
+            else:
+                sw = self.winfo_screenwidth()
+                self.geometry(f"{self._W}x{self._H}+{sw - 84}+8")
+
+            self._canvas = tk.Canvas(
+                self, width=self._W, height=self._H, bg="#1e1e1e", highlightthickness=0
             )
-            self._blink_job: str | None = None
+            self._canvas.pack()
+
+            self._wave_job: str | None = None
+            self._wave_frame: int = 0
+            self._done_job: str | None = None
+            self._drag_ox: int = 0
+            self._drag_oy: int = 0
+
+            self._canvas.bind("<Button-3>", lambda _: self.destroy())
+            self._canvas.bind("<Button-2>", self._on_open_log)
+            self._canvas.bind("<Button-1>", self._on_drag_start)
+            self._canvas.bind("<B1-Motion>", self._on_drag_move)
+            self._canvas.bind("<ButtonRelease-1>", self._on_drag_end)
+
             self.set_state("idle")
 
-            # Right-click to exit
-            self._canvas.bind("<Button-3>", lambda _: self.destroy())
+        def _on_open_log(self, event=None) -> None:
+            """Middle-click: open voice-fep.log in the default text editor."""
+            log_path = _get_log_path()
+            if log_path.exists():
+                os.startfile(str(log_path))
+            else:
+                try:
+                    import tkinter.messagebox as _mb
+                    _mb.showinfo(
+                        "voice-fep",
+                        f"ログファイルが見つかりません:\n{log_path}\n\n"
+                        "ENABLE_LOG_FILE=true を .env に設定してください。",
+                    )
+                except Exception:
+                    pass
 
-        def set_state(self, state: str):
-            icon, color = self._STATES.get(state, self._STATES["idle"])
-            self._canvas.itemconfig(self._item, text=icon, fill=color)
-            if self._blink_job:
-                self.after_cancel(self._blink_job)
-                self._blink_job = None
-            if state == "recording":
-                self._blink(True)
+        def _on_drag_start(self, event: tk.Event) -> None:
+            self._drag_ox = event.x_root - self.winfo_x()
+            self._drag_oy = event.y_root - self.winfo_y()
 
-        def _blink(self, bright: bool):
-            color = "#e53935" if bright else "#b71c1c"
-            self._canvas.itemconfig(self._item, fill=color)
-            self._blink_job = self.after(400, lambda: self._blink(not bright))
+        def _on_drag_move(self, event: tk.Event) -> None:
+            self.geometry(f"+{event.x_root - self._drag_ox}+{event.y_root - self._drag_oy}")
 
-        def safe_set_state(self, state: str):
+        def _on_drag_end(self, event: tk.Event) -> None:
+            _save_window_pos(self.winfo_x(), self.winfo_y())
+
+        def _draw_mic(self, col: str = "#aaaaaa") -> None:
+            c = self._canvas
+            c.delete("all")
+            # round-capped line is the only seam-free way to render a symmetric pill in tkinter
+            c.create_line(36, 16, 36, 36, fill=col, width=16, capstyle="round")
+            # U-arm: tops at capsule waist (y=33), bottoms meet arc at y=44 (~2/3 of old arm length)
+            c.create_line(22, 33, 22, 44, fill=col, width=2)
+            c.create_arc(22, 36, 50, 52, start=180, extent=180, style="arc", outline=col, width=2)
+            c.create_line(50, 33, 50, 44, fill=col, width=2)
+            c.create_line(36, 52, 36, 57, fill=col, width=2)
+            c.create_line(27, 57, 45, 57, fill=col, width=2)
+
+        def _draw_wave(self) -> None:
+            c, col = self._canvas, "#38bdf8"
+            c.delete("all")
+            heights = _WAVE_FRAMES[self._wave_frame % len(_WAVE_FRAMES)]
+            x0 = (self._W - self._N_BARS * self._BAR_W - (self._N_BARS - 1) * self._BAR_GAP) // 2
+            cy = self._H // 2
+            for i, h in enumerate(heights):
+                x1 = x0 + i * (self._BAR_W + self._BAR_GAP)
+                c.create_rectangle(x1, cy - h // 2, x1 + self._BAR_W, cy + h // 2,
+                                   fill=col, outline="")
+            self._wave_frame += 1
+
+        def _tick_wave(self) -> None:
+            if self._wave_job is None:
+                return
+            self._draw_wave()
+            self._wave_job = self.after(self._WAVE_MS, self._tick_wave)
+
+        def set_state(self, state: str) -> None:
+            if self._wave_job is not None:
+                self.after_cancel(self._wave_job)
+                self._wave_job = None
+            if self._done_job is not None:
+                self.after_cancel(self._done_job)
+                self._done_job = None
+            c = self._canvas
+            if state == "idle":
+                self._draw_mic()
+            elif state == "recording":
+                self._wave_frame = 0
+                self._wave_job = self.after(0, self._tick_wave)
+            elif state == "processing":
+                self._draw_mic("#fbc02d")
+            elif state == "done":
+                c.delete("all")
+                c.create_line(24, 36, 32, 44, fill="#4ade80", width=3,
+                              capstyle="round", joinstyle="round")
+                c.create_line(32, 44, 50, 26, fill="#4ade80", width=3,
+                              capstyle="round", joinstyle="round")
+                self._done_job = self.after(400, lambda: self.set_state("idle"))
+            elif state == "error":
+                c.delete("all")
+                c.create_text(36, 36, text="×", fill="#f57c00",
+                              font=("Segoe UI Symbol", 30, "bold"))
+
+        def safe_set_state(self, state: str) -> None:
             """Thread-safe state update via tkinter event queue."""
             self.after(0, lambda: self.set_state(state))
 
@@ -173,6 +375,9 @@ def stop_recording() -> bytes | None:
         log.info("no audio captured")
         return None
     audio = np.concatenate(chunks, axis=0)
+    if len(audio) < int(0.3 * SAMPLE_RATE):
+        log.info("recording ignored: duration too short (< 0.3s)")
+        return None
     buf = io.BytesIO()
     wavfile.write(buf, SAMPLE_RATE, audio)
     log.info("recording stopped: %d samples (%.1fs)", len(audio), len(audio) / SAMPLE_RATE)
@@ -187,7 +392,7 @@ def transcribe(wav_bytes: bytes) -> str:
         return _transcribe_gemini(wav_bytes)
     if BACKEND == "cloudflare":
         return _transcribe_cloudflare(wav_bytes)
-    if BACKEND == "local_whisper":
+    if BACKEND in ("local", "local_whisper"):  # local_whisper kept for backward compat
         return _transcribe_local(wav_bytes)
     raise ValueError(f"Unknown BACKEND: {BACKEND!r}")
 
@@ -207,7 +412,7 @@ def _transcribe_gemini(wav_bytes: bytes) -> str:
                 types.Part(text="上記の音声を書き起こしてください。"),
             ])
         ],
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+        config=types.GenerateContentConfig(system_instruction=_build_system_prompt()),
     )
     return (response.text or "").strip()
 
@@ -236,38 +441,185 @@ def _transcribe_local(wav_bytes: bytes) -> str:
     buf = io.BytesIO(wav_bytes)
     _, audio_int16 = wavfile.read(buf)
     audio_float32 = audio_int16.astype(np.float32) / 32768.0
-    model = WhisperModel("small", device="cpu", compute_type="int8")
-    segments, _ = model.transcribe(audio_float32, language="ja", sampling_rate=SAMPLE_RATE)
+    model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+    words = load_dictionary()
+    initial_prompt = ", ".join(words) if words else None
+    # sampling_rate is not a valid arg for transcribe(); faster-whisper expects 16kHz internally
+    segments, _ = model.transcribe(audio_float32, language="ja", initial_prompt=initial_prompt)
     return "".join(s.text for s in segments).strip()
+
+
+def _backend_info() -> str:
+    """Return a startup-log description of the active backend and model."""
+    if BACKEND in ("local", "local_whisper"):
+        return f"backend: local, model: {WHISPER_MODEL}"
+    if BACKEND == "cloudflare":
+        return "backend: cloudflare, model: @cf/openai/whisper"
+    return f"backend: {BACKEND}, model: {GEMINI_MODEL}"
+
+
+def _check_backend_config() -> None:
+    """Validate backend config at startup; fall back to local if GEMINI_API_KEY is missing."""
+    global BACKEND
+    if BACKEND != "gemini" or GEMINI_API_KEY:
+        return
+    log.warning(
+        "GEMINI_API_KEY is not set; falling back to local Whisper backend. "
+        "Set GEMINI_API_KEY in .env to use Gemini."
+    )
+    try:
+        import tkinter.messagebox as _mb
+        _mb.showwarning(
+            "voice-fep — APIキー未設定",
+            "GEMINI_API_KEY が未設定のため、ローカル Whisper モード（BACKEND=local）で起動します。\n\n"
+            "Gemini を使うには .env ファイルに GEMINI_API_KEY を設定してください。",
+        )
+    except Exception:
+        pass  # headless environment; log warning already emitted
+    BACKEND = "local"
+
+
+# ---------------------------------------------------------------------------
+# Dictionary (カスタム辞書)
+# ---------------------------------------------------------------------------
+def get_dictionary_path() -> Path:
+    """Resolve dictionary file location: env var > ./dictionary.txt > APPDATA fallback."""
+    env_path = os.environ.get("DICTIONARY_FILE", "")
+    if env_path:
+        return Path(env_path)
+    local = Path("dictionary.txt")
+    if local.exists():
+        return local.resolve()
+    appdata = os.environ.get("APPDATA", "")
+    base = Path(appdata) if appdata else Path.home() / ".config"
+    return base / "voice-fep" / "dictionary.txt"
+
+
+def load_dictionary() -> list[str]:
+    path = get_dictionary_path()
+    if not path.exists():
+        return []
+    return [
+        w for line in path.read_text(encoding="utf-8").splitlines()
+        if (w := line.strip()) and not w.startswith("#")
+    ]
+
+
+def load_system_prompt() -> str:
+    """Return system_prompt.txt content if present and non-empty, else SYSTEM_PROMPT constant."""
+    candidates: list[Path] = [Path("system_prompt.txt")]
+    if getattr(sys, "frozen", False):
+        candidates.append(_get_exe_dir() / "system_prompt.txt")
+    for path in candidates:
+        if path.exists():
+            content = path.read_text(encoding="utf-8").strip()
+            if content:
+                return content
+    return SYSTEM_PROMPT
+
+
+def _build_system_prompt() -> str:
+    """Return base prompt with user vocabulary appended when dictionary has entries."""
+    base = load_system_prompt()
+    words = load_dictionary()
+    if not words:
+        return base
+    return (
+        base
+        + "\n\n【優先使用する語彙】\n"
+        + "発話内に明確に該当語彙が含まれている場合のみ、正確にこの表記で書き起こすこと:\n"
+        + "、".join(words)
+    )
+
+
+def _add_from_clipboard():
+    """Ctrl+F8 handler: append clipboard text to dictionary if non-empty and not duplicate."""
+    word = pyperclip.paste().strip()
+    if not word:
+        return
+    if word in load_dictionary():
+        return
+    path = get_dictionary_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(word + "\n")
+    log.info("Added to dictionary: %s", word)
 
 
 # ---------------------------------------------------------------------------
 # Paste (preserves focus on active window)
 # ---------------------------------------------------------------------------
 def paste_text(text: str):
+    global _pasting
+    _pasting = True
     pyperclip.copy(text)
     pyautogui.hotkey("ctrl", "v")
-    # Clear clipboard after paste — do not leave transcribed text in clipboard
-    threading.Timer(0.5, lambda: pyperclip.copy("")).start()
+    # Clear clipboard and release pasting guard after the Ctrl+V key state settles
+    def _cleanup():
+        global _pasting
+        pyperclip.copy("")
+        _pasting = False
+    threading.Timer(0.5, _cleanup).start()
 
 
 # ---------------------------------------------------------------------------
 # Key event handlers
 # ---------------------------------------------------------------------------
+def _auto_stop(indicator: Indicator):
+    """Called by _record_timer when RECORD_MAX_SEC is reached."""
+    global _active, _record_timer, _blocked_until_release
+    if not _active:
+        return
+    _active = False
+    _record_timer = None
+    # Prevent OS key-repeat from starting a new recording before the key is physically released
+    _blocked_until_release = True
+    log.info("recording stopped: reached max duration (%ds)", RECORD_MAX_SEC)
+    indicator.safe_set_state("processing")
+    threading.Thread(target=_process_and_paste, args=(indicator,), daemon=True).start()
+
+
 def _on_press(key, indicator: Indicator):
-    global _active
-    if key != HOTKEY or _active:
+    global _active, _record_timer, _mods_held
+    if key in _ALL_MOD_KEYS:
+        _mods_held.add(key)
+        return
+    # Dict hotkey (default shift+space): add selected text to dictionary
+    if key == _DICT_KEY and _DICT_MODS and bool(_DICT_MODS & _mods_held):
+        threading.Thread(target=_add_from_clipboard, daemon=True).start()
+        return
+    # Record hotkey (default ctrl+space): start PTT recording
+    if key != _RECORD_KEY:
+        return
+    if _RECORD_MODS and not bool(_RECORD_MODS & _mods_held):
+        return
+    if _active or _blocked_until_release or _pasting:
         return
     _active = True
     indicator.safe_set_state("recording")
     start_recording()
+    _record_timer = threading.Timer(RECORD_MAX_SEC, _auto_stop, args=(indicator,))
+    _record_timer.daemon = True
+    _record_timer.start()
 
 
 def _on_release(key, indicator: Indicator):
-    global _active
-    if key != HOTKEY or not _active:
+    global _active, _record_timer, _blocked_until_release, _mods_held
+    if key in _ALL_MOD_KEYS:
+        _mods_held.discard(key)
+        return
+    if key != _RECORD_KEY:
+        return
+    # Physical release always clears the block — do this before checking _active
+    if _blocked_until_release:
+        _blocked_until_release = False
+        return  # _process_and_paste was already launched by _auto_stop
+    if not _active:
         return
     _active = False
+    if _record_timer is not None:
+        _record_timer.cancel()
+        _record_timer = None
     indicator.safe_set_state("processing")
     threading.Thread(target=_process_and_paste, args=(indicator,), daemon=True).start()
 
@@ -280,12 +632,14 @@ def _process_and_paste(indicator: Indicator):
             indicator.safe_set_state("idle")
             return
         t0 = time.perf_counter()
-        text = transcribe(wav_bytes)
+        text = transcribe(wav_bytes).strip()
         elapsed = time.perf_counter() - t0
         log.info("transcription took %.2fs, %d chars", elapsed, len(text))
         if text:
             paste_text(text)
-        indicator.safe_set_state("idle")
+            indicator.safe_set_state("done")
+        else:
+            indicator.safe_set_state("idle")
     except Exception as exc:
         log.error("error during transcription: %s: %s", type(exc).__name__, exc)
         indicator.safe_set_state("error")
@@ -296,6 +650,23 @@ def _process_and_paste(indicator: Indicator):
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
+    parser = argparse.ArgumentParser(
+        prog="voice-fep",
+        description="Windows 常駐型音声入力 FEP ツール",
+    )
+    parser.add_argument(
+        "--show-prompt",
+        action="store_true",
+        help="Print the effective Gemini system prompt (with dictionary injected) and exit.",
+    )
+    args = parser.parse_args()
+
+    if args.show_prompt:
+        print(_build_system_prompt())
+        return
+
+    _setup_logging()
+    _check_backend_config()
     indicator = Indicator()
 
     listener = keyboard.Listener(
@@ -303,8 +674,8 @@ def main():
         on_release=lambda key: _on_release(key, indicator),
     )
     listener.start()
-    log.info("voice-fep v%s ready (model: %s) — F8 to record, right-click indicator to quit",
-             APP_VERSION, GEMINI_MODEL)
+    log.info("voice-fep v%s ready (%s) — %s to record, %s to add dict — right-click to quit",
+             APP_VERSION, _backend_info(), HOTKEY, DICT_HOTKEY)
 
     try:
         indicator.mainloop()

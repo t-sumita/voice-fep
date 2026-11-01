@@ -1,85 +1,212 @@
 # voice-fep
 
-Windows 常駐型・音声入力 FEP ツール。  
-ホットキー **F8** を押している間だけ録音し、離すと Gemini API が書き起こして  
-アクティブウィンドウにそのままペーストする。
+> AI の音声入力がとても使いやすくなってきたので、どこでも手軽に使える常駐型の音声入力 FEP（入力システム）に仕立ててみました。  
+> Google Gemini による高精度な文字起こしをベースにしつつ、API キーが使えない環境やオフラインでも安心して使えるよう、PC 単体で完結するローカルモード（Whisper）も備えています。
+
+ホットキー（`Ctrl + Space`）を押している間だけ音声を録音し、離した瞬間にアクティブな画面（メモ帳、ブラウザ、チャットツールなど）へダイレクトにテキストを貼り付けます。
 
 ---
 
-## クイックスタート
+## 🚀 クイックスタート（ダウンロードして使う）
 
-```powershell
-# 1. Python 3.11+ が必要
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+Python やコマンドプロンプトの操作は不要です。
 
-# 2. 依存パッケージのインストール
-pip install -r requirements.txt
+1. **ダウンロード**  
+   [Releases](../../releases) から最新の `voice-fep-v0.8.1-win64.zip` をダウンロードして解凍します。
+2. **起動する**  
+   フォルダ内の `voice-fep.exe` をダブルクリックするだけで常駐を開始します。
 
-# 3. 環境変数の設定
-copy .env.example .env
-# .env を開いて GEMINI_API_KEY を記入する
+### 動作モードについて（初回起動時の注意）
 
-# 4. 起動
-python main.py
-# または コンソール非表示で起動:
-# wscript run_silent.vbs
+本ツールには用途に合わせて選べる 2 つのモードがあります。
+
+- **ローカル Whisper モード（初期状態・完全無料）**  
+  特別な設定なしでそのまま起動すると、このモードで動作します。  
+  音声データはお使いの PC 内だけで処理され、インターネット上へ送信されません。  
+  ※初回録音時のみ、推論モデル（約 150 MB）が自動ダウンロードされます。
+
+- **Gemini モード（高精度・低遅延・推奨）**  
+  Google の AI を使い、言い淀みの除去や自然な句読点補正を行います。  
+  フォルダ内の `.env.example` を `.env` にリネームし、[Google AI Studio](https://aistudio.google.com/) で取得した無料の API キーを記載してください。
+
+```env
+GEMINI_API_KEY=あなたのAPIキー
 ```
 
-F8 を押して話し、離すと書き起こしがアクティブウィンドウにペーストされます。  
-終了するにはインジケータを右クリック → 終了、または Ctrl+C。
+> ※ キーが未設定のまま起動してもエラー終了せず、自動的に安全なローカルモードへ切り替わります。
 
 ---
 
-## 設計思想: SDD + Secure Vibe Coding
+## 🎙️ 基本的な使い方
 
-### SDD（仕様駆動開発）
+| 操作 | 動作 |
+|------|------|
+| **Ctrl + Space（長押し）** | 押している間だけ録音。キーを離すと文字起こし結果を自動入力 |
+| **Shift + Space** | 選択中のテキスト（固有名詞など）をカスタム辞書に即座に登録 |
+| **マウス中クリック（ホイール押し込み）** | 画面上のマイクアイコン上で押すと、動作ログ（メモ帳）を表示 |
+| **右クリック** | アプリの終了 |
+
+### 便利なカスタム辞書機能
+
+固有名詞や専門用語、社内用語などを登録しておくと認識精度が向上します。
+
+ブラウザやエディタ上で登録したい単語を選択（コピー可能な状態に）し、`Shift + Space` を押すだけで辞書に自動追加されます。
+
+---
+
+## 🔒 プライバシーとセキュリティ
+
+- **完全オープンソース:** プログラムのすべての設計図を GitHub で公開しており、隠れた不正通信はありません。
+- **選べる安全性:** 機密情報やプライベートな会話を一切外に出したくない場合は、完全オフラインで動作する「ローカル Whisper モード」をご利用いただけます。
+- **メモリ内処理の徹底:** 録音された音声データは PC のメモリ上だけで一時的に処理され、ハードディスク等に録音ファイルとして保存されることはありません。また、自動ペースト完了後、クリップボードは 0.5 秒で安全に初期化されます。
+
+---
+
+## 🛠️ トラブルシューティング
+
+うまく動かない場合は、画面上のマイクアイコンを **マウス中クリック（ホイール押し込み）** してください。メモ帳で `voice-fep.log` が開き、原因をすぐに確認できます。
+
+| 症状 | 対処 |
+|------|------|
+| 文字起こし後にスペースが連続入力される | v0.8.1 以降のキー競合ガードをご利用ください |
+| 何も書き起こされない / エラーになる | ログを開いてマイクデバイスエラーや API キーの誤りを確認 |
+| APIキーが未設定でも動かしたい | `.env` で `BACKEND=local` を設定するとローカルモードに固定されます |
+
+### ログファイルの場所
+
+| 起動方法 | ログファイルのパス |
+|---------|-----------------|
+| exe 直接実行 | `voice-fep.exe` と同じフォルダ内の `voice-fep.log` |
+| `python main.py`（開発） | `%APPDATA%\voice-fep\voice-fep.log` |
+
+---
+
+## ライセンス
+
+MIT License — Copyright (c) 2026 Subutomo Dev
+
+---
+
+<details>
+<summary>開発者向け情報（ビルド・設計・カスタマイズ）</summary>
+
+### 開発環境での実行
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+copy .env.example .env
+python main.py
+```
+
+### exe のビルド
+
+```powershell
+pip install -r requirements-build.txt
+python scripts/build.py
+# dist/voice-fep/ および配布用 zip が自動生成されます
+```
+
+### システムプロンプトの調整
+
+Gemini モード時の書き起こしルール（言い淀み除去・句読点補正・IT 用語正規化など）は  
+プロジェクト直下に `system_prompt.txt` を作成することで上書きできます（`main.py` の定数は変更不要）。
+
+現在の指示構成（6 セクション）:
+
+| セクション | 役割 |
+|-----------|------|
+| 【出力ルール】 | 書き起こし本文のみ出力、前置き・マークダウン禁止 |
+| 【フィラー・言い淀みの除去】 | 「あー」「えーと」等を削除、言い直しは最終形のみ残す |
+| 【漢字・語彙の最適化】 | 同音異義語の文脈判定、話し言葉→書き言葉変換 |
+| 【IT・プログラミング用語の正規化】 | API/GitHub 等の英略語・カタカナ IT 用語の正確な表記 |
+| 【句読点】 | 文末の句点（。）強制・読点（、）自然補完 |
+| 【分かち書き禁止】 | 単語間スペース禁止 |
+
+送信される最終プロンプト（辞書注入後）の確認:
+
+```powershell
+python main.py --show-prompt
+```
+
+### バックエンド比較
+
+| 値 | バックエンド | モデル | 用途 |
+|----|------------|--------|------|
+| `gemini`（デフォルト） | Google Gemini API | `gemini-2.0-flash` | 高精度・低コスト・推奨 |
+| `local` | faster-whisper（ローカル） | `base` / `small` 等 | オフライン・プライバシー優先 |
+| `cloudflare` | Cloudflare Workers AI | `@cf/openai/whisper` | エッジ処理 |
+
+| 観点 | Gemini Flash | ローカル Whisper |
+|------|-------------|-----------------|
+| 精度（日本語） | ◎ LLM による文脈整形込み | ○ 音響モデル精度依存 |
+| レイテンシ | ○ API 往復 1〜3 秒 | ◎ CPU で 0.5〜2 秒 |
+| コスト | 従量課金（無料枠あり） | 無料（ローカル計算） |
+| オフライン | × | ◎ |
+
+### ホットキー設定
+
+`.env` で変更可能。形式は `modifier+key`（例: `ctrl+space`, `shift+f8`, `f8`）。
+
+| 環境変数 | デフォルト | 動作 |
+|---------|-----------|------|
+| `HOTKEY` | `ctrl+space` | Push-to-Talk 録音 |
+| `DICT_HOTKEY` | `shift+space` | クリップボードの語句を辞書に追加 |
+| `ENABLE_LOG_FILE` | `true` | ファイルへのログ出力 on/off |
+| `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+
+### カスタム辞書の詳細
+
+辞書ファイルの検索順: `DICTIONARY_FILE` 環境変数 → `./dictionary.txt` → `%APPDATA%\voice-fep\dictionary.txt`
+
+```
+# コメント行（# で始まる行と空行は無視される）
+Kubernetes
+GitHub Actions
+プルリク
+```
+
+- **Gemini バックエンド**: `SYSTEM_PROMPT` 末尾に `【優先使用する語彙】` セクションとして注入
+- **ローカル Whisper バックエンド**: `WhisperModel.transcribe()` の `initial_prompt` 引数に渡す
+- 辞書は推論ごとに再読み込み → Shift+Space 追加後の次回録音から即反映
+
+### ファイル構成
+
+```
+voice-fep/
+├── main.py                 # エントリポイント
+├── requirements.txt        # 実行時依存パッケージ
+├── requirements-build.txt  # ビルド用依存（PyInstaller）
+├── voice-fep.spec          # PyInstaller スペックファイル
+├── scripts/build.py        # ビルドドライバ（zip 生成含む）
+├── system_prompt.txt       # SYSTEM_PROMPT オーバーライド（省略可）
+├── .env.example            # 環境変数テンプレート
+├── CLAUDE.md               # 開発規律（AI コーディング憲法）
+├── LESSONS_LEARNED.md      # 失敗・教訓ログ
+├── PLAN.md                 # 実装タスクチェックリスト
+├── docs/SDD.md             # 仕様駆動設計書
+└── tests/                  # ユニットテスト（pytest）
+```
+
+### 設計思想: SDD + Secure Vibe Coding
+
 仕様（`docs/SDD.md`）を先に合意し、実装はその仕様に従う。  
-仕様変更は必ずドキュメントを先に更新してからコードを変更する。
-
-### Secure Vibe Coding（CC Terminal 版）
 Claude Code（AI コーディング）を活用しながら、人間がセキュリティゲートキーパーとして機能する運用スタイル。
 
 | 役割 | 担当 |
 |------|------|
 | 提案・実装・テスト | Claude Code |
 | セキュリティレビュー・承認 | 人間（Subutomo Dev） |
-| コミット/Push の最終決定 | 人間（必須） |
+| コミット / Push の最終決定 | 人間（必須） |
 
-開発規律の詳細は `CLAUDE.md` を参照。
+セキュリティ制約（`CLAUDE.md` より）:
 
----
+| # | ルール |
+|---|--------|
+| S-1 | API キーはハードコード禁止 — `.env` + `python-dotenv` 経由のみ |
+| S-2 | 音声データのディスク書き出し禁止 — メモリ内処理のみ |
+| S-3 | ログへの音声テキスト・API キー出力禁止 |
+| S-4 | クリップボードはペースト後 0.5 秒以内に自動クリア |
 
-## ファイル構成
-
-```
-voice-fep/
-├── CLAUDE.md            # 開発憲法（タスク開始前に必読）
-├── LESSONS_LEARNED.md   # 失敗・教訓ログ
-├── PLAN.md              # 実装タスクチェックリスト
-├── main.py              # エントリポイント
-├── requirements.txt     # 依存パッケージ
-├── run_silent.vbs       # コンソールなし起動スクリプト
-├── .env.example         # 環境変数テンプレート（.env は gitignore）
-├── .gitignore
-├── LICENSE
-├── docs/
-│   └── SDD.md           # 仕様駆動設計書
-└── tests/               # テスト（フェーズ3で追加）
-```
-
----
-
-## バックエンド切替
-
-`.env` の `BACKEND` 変数で切り替え可能:
-
-| 値 | バックエンド | 備考 |
-|----|------------|------|
-| `gemini`（デフォルト） | Gemini 2.5 Flash | 高精度・低コスト |
-| `cloudflare` | Cloudflare Workers AI Whisper | エッジ処理 |
-| `local_whisper` | faster-whisper (ローカル) | オフライン・プライバシー優先 |
-
----
-
-*Copyright (c) 2026 Subutomo Dev — MIT License*
+</details>

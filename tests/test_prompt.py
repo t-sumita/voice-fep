@@ -49,6 +49,12 @@ class TestSystemPrompt:
         """Prompt must prohibit wakati-gaki (space-separated Japanese output)."""
         assert "分かち書き" in main.SYSTEM_PROMPT
 
+    def test_punctuation_rule_in_prompt(self):
+        """Prompt must instruct natural punctuation (句点・読点) insertion."""
+        assert "句読点" in main.SYSTEM_PROMPT
+        assert "句点" in main.SYSTEM_PROMPT
+        assert "読点" in main.SYSTEM_PROMPT
+
 
 class TestConfig:
     def test_sample_rate_is_16k(self):
@@ -56,19 +62,34 @@ class TestConfig:
 
     def test_app_version_defined(self):
         assert hasattr(main, "APP_VERSION")
-        assert main.APP_VERSION == "0.2.1"
+        assert main.APP_VERSION == "0.8.1"
 
     def test_default_backend_is_gemini(self, monkeypatch):
         monkeypatch.delenv("BACKEND", raising=False)
         import importlib
         importlib.reload(main)
-        assert main.BACKEND in ("gemini", "cloudflare", "local_whisper")
+        assert main.BACKEND in ("gemini", "cloudflare", "local", "local_whisper")
+
+    def test_whisper_model_default(self, monkeypatch):
+        monkeypatch.delenv("WHISPER_MODEL", raising=False)
+        import importlib
+        importlib.reload(main)
+        assert main.WHISPER_MODEL == "base"
 
     def test_gemini_model_default(self, monkeypatch):
         monkeypatch.delenv("GEMINI_MODEL", raising=False)
         import importlib
         importlib.reload(main)
         assert "gemini" in main.GEMINI_MODEL.lower()
+
+    def test_show_prompt_flag_prints_prompt(self, monkeypatch, capsys, tmp_path):
+        """--show-prompt must print the effective system prompt and return without starting UI."""
+        import sys
+        monkeypatch.chdir(tmp_path)  # no system_prompt.txt → falls back to SYSTEM_PROMPT constant
+        monkeypatch.setattr(sys, "argv", ["main.py", "--show-prompt"])
+        main.main()
+        captured = capsys.readouterr()
+        assert main.SYSTEM_PROMPT[:30] in captured.out
 
 
 class TestGeminiConfig:
