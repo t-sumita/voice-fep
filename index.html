@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>voice-fep — Windows 用 AI 音声入力 FEP</title>
+  <meta name="description" content="Ctrl+Space を押している間だけ録音し、離した瞬間にアクティブウィンドウへ直接テキスト入力。Google Gemini と Whisper のハイブリッド音声入力 FEP。">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0f172a;
+      --bg-card:   #1e293b;
+      --bg-border: #334155;
+      --cyan:      #38bdf8;
+      --purple:    #818cf8;
+      --text:      #e2e8f0;
+      --muted:     #94a3b8;
+      --radius:    1rem;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Segoe UI', 'Hiragino Sans', 'Yu Gothic UI', sans-serif;
+      line-height: 1.7;
+      min-height: 100vh;
+    }
+
+    /* ── Header / Hero ── */
+    header {
+      text-align: center;
+      padding: 5rem 1.5rem 3rem;
+      position: relative;
+      overflow: hidden;
+    }
+
+    header::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background:
+        radial-gradient(ellipse 80% 60% at 50% -10%, rgba(56,189,248,.15) 0%, transparent 70%),
+        radial-gradient(ellipse 50% 40% at 80% 50%,  rgba(129,140,248,.1) 0%, transparent 60%);
+      pointer-events: none;
+    }
+
+    .site-name {
+      font-size: clamp(2.5rem, 6vw, 4rem);
+      font-weight: 800;
+      letter-spacing: -.02em;
+      background: linear-gradient(135deg, var(--cyan) 0%, var(--purple) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      display: inline-block;
+    }
+
+    .tagline {
+      margin-top: 1.25rem;
+      font-size: clamp(1rem, 2.5vw, 1.25rem);
+      font-weight: 600;
+      color: var(--text);
+      max-width: 640px;
+      margin-inline: auto;
+    }
+
+    .sub-tagline {
+      margin-top: .75rem;
+      font-size: clamp(.875rem, 2vw, 1rem);
+      color: var(--muted);
+      max-width: 560px;
+      margin-inline: auto;
+    }
+
+    /* ── CTA buttons ── */
+    .cta-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .75rem;
+      justify-content: center;
+      margin-top: 2rem;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: .5rem;
+      padding: .75rem 1.75rem;
+      border-radius: 999px;
+      font-size: .95rem;
+      font-weight: 700;
+      text-decoration: none;
+      transition: transform .15s, box-shadow .15s, opacity .15s;
+      cursor: pointer;
+    }
+
+    .btn:hover { transform: translateY(-2px); opacity: .9; }
+
+    .btn-primary {
+      background: linear-gradient(135deg, var(--cyan) 0%, var(--purple) 100%);
+      color: #0f172a;
+      box-shadow: 0 4px 24px rgba(56,189,248,.35);
+    }
+
+    .btn-ghost {
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid var(--bg-border);
+    }
+
+    .btn-ghost:hover { color: var(--text); border-color: var(--muted); }
+
+    /* ── Hero image ── */
+    .hero-img-wrap {
+      margin: 3rem auto 0;
+      max-width: 860px;
+      padding: 0 1.5rem;
+    }
+
+    .hero-img-wrap img {
+      width: 100%;
+      border-radius: var(--radius);
+      box-shadow:
+        0 0 0 1px rgba(56,189,248,.18),
+        0 8px 40px rgba(56,189,248,.18),
+        0 2px 80px rgba(129,140,248,.12);
+      display: block;
+    }
+
+    /* ── Features ── */
+    .features {
+      padding: 5rem 1.5rem;
+      max-width: 960px;
+      margin-inline: auto;
+    }
+
+    .section-label {
+      text-align: center;
+      font-size: .8rem;
+      font-weight: 700;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      color: var(--cyan);
+      margin-bottom: .75rem;
+    }
+
+    .section-title {
+      text-align: center;
+      font-size: clamp(1.5rem, 4vw, 2rem);
+      font-weight: 800;
+      margin-bottom: 3rem;
+    }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 1.5rem;
+    }
+
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--bg-border);
+      border-radius: var(--radius);
+      padding: 2rem;
+      transition: border-color .2s, transform .2s, box-shadow .2s;
+    }
+
+    .card:hover {
+      border-color: rgba(56,189,248,.4);
+      transform: translateY(-3px);
+      box-shadow: 0 8px 32px rgba(56,189,248,.1);
+    }
+
+    .card-icon {
+      font-size: 2rem;
+      margin-bottom: 1rem;
+      display: block;
+    }
+
+    .card-title {
+      font-size: 1.1rem;
+      font-weight: 700;
+      margin-bottom: .5rem;
+      color: var(--text);
+    }
+
+    .card-body {
+      font-size: .9rem;
+      color: var(--muted);
+      line-height: 1.7;
+    }
+
+    .kbd {
+      display: inline-block;
+      background: #0f172a;
+      border: 1px solid var(--bg-border);
+      border-radius: .25rem;
+      padding: .1em .4em;
+      font-size: .8em;
+      font-family: monospace;
+      color: var(--cyan);
+      line-height: 1.5;
+    }
+
+    /* ── Divider ── */
+    .divider {
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--bg-border), transparent);
+      max-width: 680px;
+      margin: 0 auto;
+    }
+
+    /* ── Footer ── */
+    footer {
+      text-align: center;
+      padding: 2.5rem 1.5rem 3rem;
+      font-size: .85rem;
+      color: var(--muted);
+    }
+
+    footer a {
+      color: var(--muted);
+      text-decoration: none;
+      border-bottom: 1px solid transparent;
+      transition: color .15s, border-color .15s;
+    }
+
+    footer a:hover { color: var(--text); border-color: var(--muted); }
+  </style>
+</head>
+<body>
+
+  <!-- ── Hero ── -->
+  <header>
+    <h1 class="site-name">voice-fep</h1>
+    <p class="tagline">AI の音声入力がいい感じなので、Windows 用の常駐型 FEP に仕立ててみました。</p>
+    <p class="sub-tagline">どこでも <kbd class="kbd">Ctrl+Space</kbd> で音声入力。Google Gemini の賢い日本語整形と、完全オフラインの Whisper のハイブリッド仕様。</p>
+
+    <div class="cta-group">
+      <a class="btn btn-primary" href="https://github.com/t-sumita/voice-fep/releases/latest">
+        &#8659;&nbsp;最新版をダウンロード（Windows 64bit）
+      </a>
+      <a class="btn btn-ghost" href="https://github.com/t-sumita/voice-fep" target="_blank" rel="noopener">
+        &#128279;&nbsp;GitHub リポジトリ
+      </a>
+    </div>
+
+    <div class="hero-img-wrap">
+      <img src="assets/hero.jpg" alt="voice-fep の動作イメージ：Ctrl+Space でトリガーし、Gemini または Whisper で文字起こし、アクティブウィンドウへペースト">
+    </div>
+  </header>
+
+  <!-- ── Features ── -->
+  <section class="features">
+    <p class="section-label">Features</p>
+    <h2 class="section-title">3 つの特徴</h2>
+    <div class="cards">
+
+      <div class="card">
+        <span class="card-icon">&#127908;</span>
+        <h3 class="card-title">どこでもプッシュ・トゥ・トーク</h3>
+        <p class="card-body">
+          <kbd class="kbd">Ctrl+Space</kbd> を押している間だけ録音し、キーを離した瞬間にメモ帳・ブラウザ・チャットツールへダイレクトペースト。アクティブなウィンドウを選ばずどこでも使えます。
+        </p>
+      </div>
+
+      <div class="card">
+        <span class="card-icon">&#10024;</span>
+        <h3 class="card-title">Gemini &times; Whisper ハイブリッド</h3>
+        <p class="card-body">
+          クラウド版は Google Gemini が言い淀みを除去し、自然な句読点を整形。APIキーなし・オフライン環境では Whisper がローカル完結で動作。プライバシーも速度も両立します。
+        </p>
+      </div>
+
+      <div class="card">
+        <span class="card-icon">&#128230;</span>
+        <h3 class="card-title">インストール不要</h3>
+        <p class="card-body">
+          ZIP を解凍して <code class="kbd">voice-fep.exe</code> を起動するだけ。Python 環境や追加インストールは一切不要です。設定は隣の <code class="kbd">.env</code> ファイルを編集するだけ。
+        </p>
+      </div>
+
+    </div>
+  </section>
+
+  <div class="divider"></div>
+
+  <!-- ── Footer ── -->
+  <footer>
+    <p>MIT License &nbsp;&middot;&nbsp; &copy; 2026 voice-fep project</p>
+    <p style="margin-top:.4rem;">
+      <a href="https://github.com/t-sumita/voice-fep" target="_blank" rel="noopener">github.com/t-sumita/voice-fep</a>
+    </p>
+  </footer>
+
+</body>
+</html>
