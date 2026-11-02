@@ -12,7 +12,7 @@
 Python やコマンドプロンプトの操作は不要です。
 
 1. **ダウンロード**  
-   [Releases](../../releases) から最新の `voice-fep-v0.8.1-win64.zip` をダウンロードして解凍します。
+   [Releases](../../releases) から最新の `voice-fep-vX.X.X-win64.zip` をダウンロードして解凍します。
 2. **起動する**  
    フォルダ内の `voice-fep.exe` をダブルクリックするだけで常駐を開始します。
 
