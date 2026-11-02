@@ -62,7 +62,7 @@ class TestConfig:
 
     def test_app_version_defined(self):
         assert hasattr(main, "APP_VERSION")
-        assert main.APP_VERSION == "0.8.1"
+        assert main.APP_VERSION == "0.8.2"
 
     def test_default_backend_is_gemini(self, monkeypatch):
         monkeypatch.delenv("BACKEND", raising=False)

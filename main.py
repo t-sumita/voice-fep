@@ -73,7 +73,7 @@ def _get_log_path() -> Path:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION: str = "0.8.1"
+APP_VERSION: str = "0.8.2"
 GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 BACKEND: str = os.environ.get("BACKEND", "gemini")
