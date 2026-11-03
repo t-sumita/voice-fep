@@ -73,7 +73,7 @@ def _get_log_path() -> Path:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION: str = "0.8.2"
+APP_VERSION: str = "0.8.3"
 GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 BACKEND: str = os.environ.get("BACKEND", "gemini")
@@ -156,6 +156,7 @@ def _setup_logging() -> None:
 _active = False               # True while trigger key is held and recording
 _blocked_until_release = False  # True after auto-stop; blocks key-repeat from restarting
 _pasting = False              # True during clipboard write + Ctrl+V; blocks spurious recording
+_is_processing = False        # True from recording-stop through paste-done; prevents double execution
 _mods_held: set = set()       # currently depressed modifier keys (ctrl/shift/alt variants)
 _audio_chunks: list = []
 _stream: sd.InputStream | None = None
@@ -371,6 +372,7 @@ def stop_recording() -> bytes | None:
         _stream = None
     with _lock:
         chunks = list(_audio_chunks)
+        _audio_chunks.clear()  # immediate clear prevents re-read if stop_recording() is called twice
     if not chunks:
         log.info("no audio captured")
         return None
@@ -534,16 +536,19 @@ def _build_system_prompt() -> str:
 
 def _add_from_clipboard():
     """Ctrl+F8 handler: append clipboard text to dictionary if non-empty and not duplicate."""
-    word = pyperclip.paste().strip()
-    if not word:
-        return
-    if word in load_dictionary():
-        return
-    path = get_dictionary_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(word + "\n")
-    log.info("Added to dictionary: %s", word)
+    try:
+        word = pyperclip.paste().strip()
+        if not word:
+            return
+        if word in load_dictionary():
+            return
+        path = get_dictionary_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(word + "\n")
+        log.info("Added to dictionary: %s", word)
+    except Exception as exc:
+        log.error("_add_from_clipboard error: %s: %s", type(exc).__name__, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -552,12 +557,20 @@ def _add_from_clipboard():
 def paste_text(text: str):
     global _pasting
     _pasting = True
-    pyperclip.copy(text)
-    pyautogui.hotkey("ctrl", "v")
+    try:
+        pyperclip.copy(text)
+        pyautogui.hotkey("ctrl", "v")
+    except Exception as exc:
+        log.error("paste_text error: %s: %s", type(exc).__name__, exc)
+        _pasting = False
+        return
     # Clear clipboard and release pasting guard after the Ctrl+V key state settles
     def _cleanup():
         global _pasting
-        pyperclip.copy("")
+        try:
+            pyperclip.copy("")
+        except Exception as e:
+            log.warning("clipboard clear failed: %s", e)
         _pasting = False
     threading.Timer(0.5, _cleanup).start()
 
@@ -567,64 +580,79 @@ def paste_text(text: str):
 # ---------------------------------------------------------------------------
 def _auto_stop(indicator: Indicator):
     """Called by _record_timer when RECORD_MAX_SEC is reached."""
-    global _active, _record_timer, _blocked_until_release
-    if not _active:
-        return
-    _active = False
-    _record_timer = None
-    # Prevent OS key-repeat from starting a new recording before the key is physically released
-    _blocked_until_release = True
-    log.info("recording stopped: reached max duration (%ds)", RECORD_MAX_SEC)
-    indicator.safe_set_state("processing")
-    threading.Thread(target=_process_and_paste, args=(indicator,), daemon=True).start()
+    global _active, _record_timer, _blocked_until_release, _is_processing
+    try:
+        with _lock:
+            if not _active or _is_processing:
+                return
+            _active = False
+            _is_processing = True
+            # Prevent OS key-repeat from starting a new recording before the key is physically released
+            _blocked_until_release = True
+        _record_timer = None
+        log.info("recording stopped: reached max duration (%ds)", RECORD_MAX_SEC)
+        indicator.safe_set_state("processing")
+        threading.Thread(target=_process_and_paste, args=(indicator,), daemon=True).start()
+    except Exception as exc:
+        log.error("_auto_stop error: %s: %s", type(exc).__name__, exc)
 
 
 def _on_press(key, indicator: Indicator):
     global _active, _record_timer, _mods_held
-    if key in _ALL_MOD_KEYS:
-        _mods_held.add(key)
-        return
-    # Dict hotkey (default shift+space): add selected text to dictionary
-    if key == _DICT_KEY and _DICT_MODS and bool(_DICT_MODS & _mods_held):
-        threading.Thread(target=_add_from_clipboard, daemon=True).start()
-        return
-    # Record hotkey (default ctrl+space): start PTT recording
-    if key != _RECORD_KEY:
-        return
-    if _RECORD_MODS and not bool(_RECORD_MODS & _mods_held):
-        return
-    if _active or _blocked_until_release or _pasting:
-        return
-    _active = True
-    indicator.safe_set_state("recording")
-    start_recording()
-    _record_timer = threading.Timer(RECORD_MAX_SEC, _auto_stop, args=(indicator,))
-    _record_timer.daemon = True
-    _record_timer.start()
+    try:
+        if key in _ALL_MOD_KEYS:
+            _mods_held.add(key)
+            return
+        # Dict hotkey (default shift+space): add selected text to dictionary
+        if key == _DICT_KEY and _DICT_MODS and bool(_DICT_MODS & _mods_held):
+            threading.Thread(target=_add_from_clipboard, daemon=True).start()
+            return
+        # Record hotkey (default ctrl+space): start PTT recording
+        if key != _RECORD_KEY:
+            return
+        if _RECORD_MODS and not bool(_RECORD_MODS & _mods_held):
+            return
+        with _lock:
+            if _active or _blocked_until_release or _pasting or _is_processing:
+                return
+            _active = True
+        indicator.safe_set_state("recording")
+        start_recording()
+        _record_timer = threading.Timer(RECORD_MAX_SEC, _auto_stop, args=(indicator,))
+        _record_timer.daemon = True
+        _record_timer.start()
+    except Exception as exc:
+        log.error("_on_press error: %s: %s", type(exc).__name__, exc)
 
 
 def _on_release(key, indicator: Indicator):
-    global _active, _record_timer, _blocked_until_release, _mods_held
-    if key in _ALL_MOD_KEYS:
-        _mods_held.discard(key)
-        return
-    if key != _RECORD_KEY:
-        return
-    # Physical release always clears the block — do this before checking _active
-    if _blocked_until_release:
-        _blocked_until_release = False
-        return  # _process_and_paste was already launched by _auto_stop
-    if not _active:
-        return
-    _active = False
-    if _record_timer is not None:
-        _record_timer.cancel()
-        _record_timer = None
-    indicator.safe_set_state("processing")
-    threading.Thread(target=_process_and_paste, args=(indicator,), daemon=True).start()
+    global _active, _record_timer, _blocked_until_release, _mods_held, _is_processing
+    try:
+        if key in _ALL_MOD_KEYS:
+            _mods_held.discard(key)
+            return
+        if key != _RECORD_KEY:
+            return
+        with _lock:
+            # Physical release always clears the block — do this before checking _active
+            if _blocked_until_release:
+                _blocked_until_release = False
+                return  # _process_and_paste was already launched by _auto_stop
+            if not _active or _is_processing:
+                return
+            _active = False
+            _is_processing = True
+        if _record_timer is not None:
+            _record_timer.cancel()
+            _record_timer = None
+        indicator.safe_set_state("processing")
+        threading.Thread(target=_process_and_paste, args=(indicator,), daemon=True).start()
+    except Exception as exc:
+        log.error("_on_release error: %s: %s", type(exc).__name__, exc)
 
 
 def _process_and_paste(indicator: Indicator):
+    global _is_processing
     import time  # noqa: PLC0415
     try:
         wav_bytes = stop_recording()
@@ -644,6 +672,31 @@ def _process_and_paste(indicator: Indicator):
         log.error("error during transcription: %s: %s", type(exc).__name__, exc)
         indicator.safe_set_state("error")
         threading.Timer(3.0, lambda: indicator.safe_set_state("idle")).start()
+    finally:
+        with _lock:
+            _is_processing = False
+
+
+# ---------------------------------------------------------------------------
+# Unhandled exception hooks — keep the process alive and log to file
+# ---------------------------------------------------------------------------
+def _log_unhandled_exception(exc_type, exc_value, exc_tb):
+    """sys.excepthook: log uncaught main-thread exceptions instead of silent crash."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    log.critical("Unhandled exception", exc_info=(exc_type, exc_value, exc_tb))
+
+
+def _log_thread_exception(args):
+    """threading.excepthook: log uncaught exceptions in daemon threads."""
+    if args.exc_type is SystemExit:
+        return
+    log.critical(
+        "Unhandled thread exception in %s",
+        getattr(args.thread, "name", str(args.thread)),
+        exc_info=(args.exc_type, args.exc_value, args.exc_tb),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -666,6 +719,8 @@ def main():
         return
 
     _setup_logging()
+    sys.excepthook = _log_unhandled_exception
+    threading.excepthook = _log_thread_exception
     _check_backend_config()
     indicator = Indicator()
 

@@ -377,6 +377,7 @@ class TestRecordMaxDuration:
         from pynput import keyboard as kb
         monkeypatch.setattr(main, "_active", False)
         monkeypatch.setattr(main, "_blocked_until_release", False)
+        monkeypatch.setattr(main, "_is_processing", False)
         # Simulate Ctrl held so ctrl+space record hotkey fires
         monkeypatch.setattr(main, "_mods_held", {kb.Key.ctrl_l})
         monkeypatch.setattr(main, "start_recording", lambda: None)
@@ -399,6 +400,7 @@ class TestRecordMaxDuration:
 
         monkeypatch.setattr(main, "_active", True)
         monkeypatch.setattr(main, "_blocked_until_release", False)
+        monkeypatch.setattr(main, "_is_processing", False)
         monkeypatch.setattr(main, "_record_timer", _FakeTimer())
         monkeypatch.setattr(
             main, "_process_and_paste", lambda _: None,
@@ -416,6 +418,7 @@ class TestRecordMaxDuration:
         monkeypatch.setattr(main, "_active", True)
         monkeypatch.setattr(main, "_record_timer", None)
         monkeypatch.setattr(main, "_blocked_until_release", False)
+        monkeypatch.setattr(main, "_is_processing", False)
         monkeypatch.setattr(main, "_process_and_paste", lambda _: None)
 
         class _FakeIndicator:
@@ -1049,3 +1052,235 @@ class TestLogSetup:
         src = (Path(__file__).parent.parent / "main.py").read_text(encoding="utf-8")
         assert "Button-2" in src
         assert "_on_open_log" in src
+
+
+class TestProcessingLock:
+    """_is_processing flag prevents double execution of the transcription pipeline."""
+
+    def _fake_indicator(self):
+        class _FI:
+            def safe_set_state(self, _): pass
+        return _FI()
+
+    def _record_key_with_ctrl(self, monkeypatch):
+        from pynput import keyboard as kb
+        monkeypatch.setattr(main, "_mods_held", {kb.Key.ctrl_l})
+        return main._RECORD_KEY
+
+    def test_is_processing_flag_exists(self):
+        assert hasattr(main, "_is_processing")
+
+    def test_is_processing_blocks_recording_start(self, monkeypatch):
+        """While _is_processing is True, _on_press must not start a new recording."""
+        key = self._record_key_with_ctrl(monkeypatch)
+        monkeypatch.setattr(main, "_active", False)
+        monkeypatch.setattr(main, "_blocked_until_release", False)
+        monkeypatch.setattr(main, "_pasting", False)
+        monkeypatch.setattr(main, "_is_processing", True)
+        started: list = []
+        monkeypatch.setattr(main, "start_recording", lambda: started.append(1))
+        main._on_press(key, self._fake_indicator())
+        assert not started, "start_recording must not fire while _is_processing is True"
+
+    def test_on_release_sets_is_processing(self, monkeypatch):
+        """_on_release must set _is_processing=True before spawning the worker thread."""
+        key = self._record_key_with_ctrl(monkeypatch)
+        monkeypatch.setattr(main, "_active", True)
+        monkeypatch.setattr(main, "_blocked_until_release", False)
+        monkeypatch.setattr(main, "_is_processing", False)
+        monkeypatch.setattr(main, "_record_timer", None)
+        threads_started: list = []
+
+        class _FakeThread:
+            def __init__(self, target, args, daemon=True):
+                self._target = target
+            def start(self):
+                threads_started.append(self._target)
+
+        monkeypatch.setattr(main.threading, "Thread", _FakeThread)
+        main._on_release(key, self._fake_indicator())
+        assert main._is_processing is True, "_is_processing must be True after _on_release"
+        assert threads_started, "worker thread must have been started"
+
+    def test_on_release_double_call_starts_thread_once(self, monkeypatch):
+        """Rapid duplicate _on_release must start _process_and_paste exactly once."""
+        key = self._record_key_with_ctrl(monkeypatch)
+        monkeypatch.setattr(main, "_active", True)
+        monkeypatch.setattr(main, "_blocked_until_release", False)
+        monkeypatch.setattr(main, "_is_processing", False)
+        monkeypatch.setattr(main, "_record_timer", None)
+        threads_started: list = []
+
+        class _FakeThread:
+            def __init__(self, target, args, daemon=True): pass
+            def start(self): threads_started.append(1)
+
+        monkeypatch.setattr(main.threading, "Thread", _FakeThread)
+        ind = self._fake_indicator()
+        main._on_release(key, ind)  # first call — should proceed
+        main._on_release(key, ind)  # second call — should be blocked by _is_processing
+        assert len(threads_started) == 1, "thread must start exactly once for duplicate release"
+
+    def test_process_and_paste_clears_is_processing_on_success(self, monkeypatch):
+        """_is_processing must be False after _process_and_paste completes normally."""
+        monkeypatch.setattr(main, "_is_processing", True)
+        monkeypatch.setattr(main, "stop_recording", lambda: None)  # simulate no audio
+
+        class _FI:
+            states: list = []
+            def safe_set_state(self, s): self.states.append(s)
+
+        ind = _FI()
+        main._process_and_paste(ind)
+        assert main._is_processing is False, "_is_processing must be cleared in finally block"
+
+    def test_process_and_paste_clears_is_processing_on_exception(self, monkeypatch):
+        """_is_processing must be cleared even when transcription raises."""
+        monkeypatch.setattr(main, "_is_processing", True)
+
+        def _boom():
+            raise RuntimeError("transcription error")
+
+        monkeypatch.setattr(main, "stop_recording", _boom)
+        timers_started: list = []
+
+        class _FakeTimer:
+            def __init__(self, delay, fn): pass
+            def start(self): timers_started.append(1)
+
+        monkeypatch.setattr(main.threading, "Timer", _FakeTimer)
+
+        class _FI:
+            def safe_set_state(self, _): pass
+
+        main._process_and_paste(_FI())
+        assert main._is_processing is False, "_is_processing must be cleared even after exception"
+
+    def test_auto_stop_sets_is_processing(self, monkeypatch):
+        """_auto_stop must atomically set _is_processing before starting worker thread."""
+        monkeypatch.setattr(main, "_active", True)
+        monkeypatch.setattr(main, "_is_processing", False)
+        monkeypatch.setattr(main, "_record_timer", None)
+        threads_started: list = []
+
+        class _FakeThread:
+            def __init__(self, target, args, daemon=True): pass
+            def start(self): threads_started.append(1)
+
+        monkeypatch.setattr(main.threading, "Thread", _FakeThread)
+
+        class _FI:
+            def safe_set_state(self, _): pass
+
+        main._auto_stop(_FI())
+        assert main._is_processing is True
+        assert threads_started
+
+    def test_auto_stop_noop_when_already_processing(self, monkeypatch):
+        """If _is_processing is already True, _auto_stop must not start a second thread."""
+        monkeypatch.setattr(main, "_active", True)
+        monkeypatch.setattr(main, "_is_processing", True)
+        threads_started: list = []
+
+        class _FakeThread:
+            def __init__(self, *a, **kw): pass
+            def start(self): threads_started.append(1)
+
+        monkeypatch.setattr(main.threading, "Thread", _FakeThread)
+
+        class _FI:
+            def safe_set_state(self, _): pass
+
+        main._auto_stop(_FI())
+        assert not threads_started, "_auto_stop must be a no-op if _is_processing is already True"
+
+    def test_stop_recording_clears_audio_chunks(self, monkeypatch):
+        """stop_recording() must clear _audio_chunks immediately to prevent double-read."""
+        sample = np.zeros((1600, 1), dtype=np.int16)
+        monkeypatch.setattr(main, "_audio_chunks", [sample])
+        monkeypatch.setattr(main, "_stream", None)
+        main.stop_recording()
+        assert main._audio_chunks == [], "_audio_chunks must be cleared after stop_recording"
+
+
+class TestCrashResilience:
+    """Exceptions in callbacks must be caught and logged; process must survive."""
+
+    def _fake_indicator(self):
+        class _FI:
+            def safe_set_state(self, _): pass
+        return _FI()
+
+    def test_on_press_exception_is_caught(self, monkeypatch, caplog):
+        """Exception inside _on_press body must be logged, not propagated."""
+        monkeypatch.setattr(main, "_mods_held", set())
+
+        def _boom(key):
+            raise RuntimeError("simulated press error")
+
+        # Patch _ALL_MOD_KEYS membership check to raise
+        monkeypatch.setattr(main, "_ALL_MOD_KEYS", type("_Boom", (), {"__contains__": lambda s, k: _boom(k)})())
+        import logging
+        with caplog.at_level(logging.ERROR, logger="voice-fep"):
+            main._on_press(object(), self._fake_indicator())  # must not raise
+        assert any("_on_press" in r.message for r in caplog.records)
+
+    def test_on_release_exception_is_caught(self, monkeypatch, caplog):
+        """Exception inside _on_release body must be logged, not propagated."""
+        monkeypatch.setattr(main, "_mods_held", set())
+        monkeypatch.setattr(main, "_ALL_MOD_KEYS", type("_Boom", (), {"__contains__": lambda s, k: (_ for _ in ()).throw(RuntimeError("simulated release error"))})())
+        import logging
+        with caplog.at_level(logging.ERROR, logger="voice-fep"):
+            main._on_release(object(), self._fake_indicator())
+        assert any("_on_release" in r.message for r in caplog.records)
+
+    def test_paste_text_clipboard_error_caught(self, monkeypatch, caplog):
+        """If pyperclip.copy raises, paste_text must log the error and clear _pasting."""
+        monkeypatch.setattr(main, "_pasting", False)
+        monkeypatch.setattr(main.pyperclip, "copy", lambda _: (_ for _ in ()).throw(OSError("clipboard locked")))
+        import logging
+        with caplog.at_level(logging.ERROR, logger="voice-fep"):
+            main.paste_text("テスト")
+        assert main._pasting is False, "_pasting must be cleared after paste error"
+        assert any("paste_text" in r.message for r in caplog.records)
+
+    def test_paste_cleanup_clipboard_error_caught(self, monkeypatch, caplog):
+        """If clipboard clear in _cleanup raises, _pasting must still become False."""
+        copy_calls: list = []
+
+        def _copy(v):
+            copy_calls.append(v)
+            if v == "":  # the clear call
+                raise OSError("clipboard locked on clear")
+
+        monkeypatch.setattr(main, "_pasting", False)
+        monkeypatch.setattr(main.pyperclip, "copy", _copy)
+        monkeypatch.setattr(main.pyautogui, "hotkey", lambda *a: None)
+        cleanup_fns: list = []
+
+        class _FakeTimer:
+            def __init__(self, delay, fn): cleanup_fns.append(fn)
+            def start(self): pass
+
+        monkeypatch.setattr(main.threading, "Timer", _FakeTimer)
+        main.paste_text("テスト")
+        import logging
+        with caplog.at_level(logging.WARNING, logger="voice-fep"):
+            cleanup_fns[0]()  # simulate timer firing with failing clear
+        assert main._pasting is False, "_pasting must be cleared even when clipboard clear fails"
+
+    def test_add_from_clipboard_exception_caught(self, monkeypatch, caplog):
+        """Exception in _add_from_clipboard must be caught and logged."""
+        monkeypatch.setattr(main.pyperclip, "paste", lambda: (_ for _ in ()).throw(OSError("no clipboard")))
+        import logging
+        with caplog.at_level(logging.ERROR, logger="voice-fep"):
+            main._add_from_clipboard()  # must not raise
+        assert any("_add_from_clipboard" in r.message for r in caplog.records)
+
+    def test_excepthooks_registered_in_source(self):
+        """sys.excepthook and threading.excepthook must be wired up in main()."""
+        src = (Path(__file__).parent.parent / "main.py").read_text(encoding="utf-8")
+        assert "sys.excepthook" in src
+        assert "threading.excepthook" in src
+        assert "_log_unhandled_exception" in src
+        assert "_log_thread_exception" in src
