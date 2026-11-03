@@ -303,30 +303,13 @@
   <script>
     window.SUBUTOMO_BADGE_CONFIG = {
       currentSiteId: "voice-fep",
-      sitesJsonPath: "https://logi-bot.pages.dev/config/subutomo-sites.json",
+      sitesJsonPath: "config/subutomo-sites.json",
       logoPath: "https://logi-bot.pages.dev/assets/logo.png",
       theme: "dark-bg",
       privacy: { localStorage: false, analytics: false },
     };
   </script>
   <script src="https://logi-bot.pages.dev/assets/subutomo-badge.js"></script>
-  <script>
-    document.addEventListener("DOMContentLoaded", function () {
-      setTimeout(function () {
-        var badge = document.querySelector(".su-badge");
-        if (badge) {
-          badge.addEventListener("click", function (e) {
-            e.stopPropagation();
-            window.open(
-              "https://docs.google.com/forms/d/e/1FAIpQLSf_thpSe4TfQ_EloElTBsCiMKgypYTKLCs0dSTmaF_FXZSvIg/viewform?usp=pp_url&entry.2036331541=Voice+FEP+(voice-fep)",
-              "_blank",
-              "noopener,noreferrer"
-            );
-          }, true);
-        }
-      }, 0);
-    });
-  </script>
 
 </body>
 </html>

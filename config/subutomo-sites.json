@@ -1,0 +1,68 @@
+[
+  {
+    "id": "spctrl-site",
+    "title": "spctrl-site",
+    "description": {
+      "en": "Immersive content portal of Subutomo Dev",
+      "ja": "Subutomo Dev のイマーシブ・コンテンツポータル"
+    },
+    "url": "https://club.subutomo.dev/",
+    "thumb": "https://club.subutomo.dev/contents/spctrl-site/thumb.png",
+    "size": 4,
+    "status": "visible"
+  },
+  {
+    "id": "strata-site",
+    "title": "strata-site",
+    "description": {
+      "en": "A visual journey through space, navigated with arrow keys or swipes",
+      "ja": "矢印キーまたはスワイプで宇宙を旅するビジュアル体験"
+    },
+    "url": "https://t-sumita.github.io/strata-site/",
+    "thumb": "https://club.subutomo.dev/contents/strata-site/thumb.png",
+    "size": 4,
+    "status": "visible"
+  },
+  {
+    "id": "subuta-site",
+    "title": "subuta-site",
+    "description": {
+      "en": "A site where quirky, adorable Subuta characters gather",
+      "ja": "へんてこりんで可愛いスブタキャラが集うサイト"
+    },
+    "url": "https://t-sumita.github.io/subuta-site/",
+    "thumb": "https://club.subutomo.dev/contents/subuta-site/thumb.png",
+    "size": 4,
+    "status": "visible"
+  },
+  {
+    "id": "donation-site",
+    "title": "☕ Ko-fi",
+    "description": {
+      "en": "Buy me a coffee!",
+      "ja": "チップをどうぞ！"
+    },
+    "url": "https://ko-fi.com/subutomo",
+    "status": "visible"
+  },
+  {
+    "id": "sponsors-site",
+    "title": "❤️ Sponsors",
+    "description": {
+      "en": "Sponsor on GitHub",
+      "ja": "GitHub でスポンサーになる"
+    },
+    "url": "https://github.com/sponsors/t-sumita",
+    "status": "visible"
+  },
+  {
+    "id": "contact-site",
+    "title": "📣 Contact",
+    "description": {
+      "en": "Send feedback",
+      "ja": "ご意見・ご要望"
+    },
+    "url": "https://docs.google.com/forms/d/e/1FAIpQLSf_thpSe4TfQ_EloElTBsCiMKgypYTKLCs0dSTmaF_FXZSvIg/viewform?usp=pp_url&entry.2036331541=Voice+FEP+(voice-fep)",
+    "status": "visible"
+  }
+]
