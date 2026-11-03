@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """voice-fep: Windows常駐型 音声入力FEPツール (F8 トグル録音 → Gemini 書き起こし → 自動ペースト)"""
 
+# faulthandler must be enabled before any other import so C-level segfaults are captured
+import faulthandler
+faulthandler.enable(file=open("crash_dump.log", "a", encoding="utf-8"))  # noqa: WPS421
+
 import argparse
 import io
 import json
 import logging
 import math
 import os
+import queue
 import sys
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -73,7 +79,7 @@ def _get_log_path() -> Path:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION: str = "0.8.3"
+APP_VERSION: str = "0.8.7"
 GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 BACKEND: str = os.environ.get("BACKEND", "gemini")
@@ -85,6 +91,13 @@ except (ValueError, TypeError):
 SAMPLE_RATE: int = 16000
 HOTKEY: str = os.environ.get("HOTKEY", "ctrl+space")
 DICT_HOTKEY: str = os.environ.get("DICT_HOTKEY", "shift+space")
+# When False (default), clipboard is NOT cleared after paste — safest against C-level crashes.
+# Set RESTORE_CLIPBOARD=true in .env to re-enable the post-paste clipboard clear (S-4).
+RESTORE_CLIPBOARD: bool = os.environ.get("RESTORE_CLIPBOARD", "false").lower() in ("true", "1", "yes")
+# Hotkey chatter guard: press events arriving within this window of the last accepted press are dropped.
+_DEBOUNCE_MS: int = 300
+# Paste cooldown: paste requests within this window of the last paste are dropped.
+_PASTE_COOLDOWN_MS: int = 500
 _RECORD_KEY, _RECORD_MODS = _parse_hotkey(HOTKEY)
 _DICT_KEY, _DICT_MODS = _parse_hotkey(DICT_HOTKEY)
 _ALL_MOD_KEYS: frozenset = _RECORD_MODS | _DICT_MODS
@@ -157,6 +170,11 @@ _active = False               # True while trigger key is held and recording
 _blocked_until_release = False  # True after auto-stop; blocks key-repeat from restarting
 _pasting = False              # True during clipboard write + Ctrl+V; blocks spurious recording
 _is_processing = False        # True from recording-stop through paste-done; prevents double execution
+_has_pasted: bool = False     # one-shot guard; reset at recording-start; prevents double paste
+_last_engine: str = ""        # set by transcribe(); used in [PASTE_EXECUTE] log
+_last_press_time: float = 0.0 # perf_counter() of last accepted press; debounce gate
+_last_paste_time: float = 0.0 # perf_counter() of last completed paste; cooldown gate
+_event_queue: queue.SimpleQueue = queue.SimpleQueue()  # keyboard events → worker thread
 _mods_held: set = set()       # currently depressed modifier keys (ctrl/shift/alt variants)
 _audio_chunks: list = []
 _stream: sd.InputStream | None = None
@@ -281,6 +299,8 @@ try:
             c.create_line(50, 33, 50, 44, fill=col, width=2)
             c.create_line(36, 52, 36, 57, fill=col, width=2)
             c.create_line(27, 57, 45, 57, fill=col, width=2)
+            if BACKEND == "gemini":
+                c.create_text(62, 62, text="☁", fill="#38bdf8", font=("Segoe UI", 10), anchor="se")
 
         def _draw_wave(self) -> None:
             c, col = self._canvas, "#38bdf8"
@@ -328,7 +348,8 @@ try:
                               font=("Segoe UI Symbol", 30, "bold"))
 
         def safe_set_state(self, state: str) -> None:
-            """Thread-safe state update via tkinter event queue."""
+            """Schedule a state change on the Tk main thread via after().
+            Safe to call from any worker thread — never call set_state() directly."""
             self.after(0, lambda: self.set_state(state))
 
 except Exception:  # pragma: no cover
@@ -351,9 +372,11 @@ def _audio_callback(indata, frames, time_info, status):
 
 
 def start_recording():
-    global _stream, _audio_chunks
+    global _stream, _audio_chunks, _has_pasted, _last_engine
     with _lock:
         _audio_chunks = []
+        _has_pasted = False
+        _last_engine = ""
     _stream = sd.InputStream(
         samplerate=SAMPLE_RATE,
         channels=1,
@@ -361,6 +384,7 @@ def start_recording():
         callback=_audio_callback,
     )
     _stream.start()
+    log.debug("[RECORD_START] ts=%.3f", time.perf_counter())
     log.info("recording started")
 
 
@@ -382,7 +406,9 @@ def stop_recording() -> bytes | None:
         return None
     buf = io.BytesIO()
     wavfile.write(buf, SAMPLE_RATE, audio)
-    log.info("recording stopped: %d samples (%.1fs)", len(audio), len(audio) / SAMPLE_RATE)
+    duration = len(audio) / SAMPLE_RATE
+    log.info("recording stopped: %d samples (%.1fs)", len(audio), duration)
+    log.debug("[RECORD_STOP] duration=%.3fs", duration)
     return buf.getvalue()
 
 
@@ -390,12 +416,36 @@ def stop_recording() -> bytes | None:
 # Backends
 # ---------------------------------------------------------------------------
 def transcribe(wav_bytes: bytes) -> str:
+    global _last_engine
     if BACKEND == "gemini":
-        return _transcribe_gemini(wav_bytes)
+        log.debug("[ENGINE_START] engine=gemini")
+        try:
+            result = _transcribe_gemini(wav_bytes)
+            _last_engine = "gemini"
+            log.debug("[ENGINE_RESULT] engine=gemini length=%d", len(result))
+            return result
+        except Exception as exc:
+            log.warning(
+                "Gemini transcription failed (%s: %s); falling back to local Whisper",
+                type(exc).__name__, exc,
+            )
+            log.debug("[ENGINE_START] engine=local_whisper (gemini_fallback)")
+            result = _transcribe_local(wav_bytes)
+            _last_engine = "local_whisper(fallback)"
+            log.debug("[ENGINE_RESULT] engine=local_whisper(fallback) length=%d", len(result))
+            return result
     if BACKEND == "cloudflare":
-        return _transcribe_cloudflare(wav_bytes)
+        log.debug("[ENGINE_START] engine=cloudflare")
+        result = _transcribe_cloudflare(wav_bytes)
+        _last_engine = "cloudflare"
+        log.debug("[ENGINE_RESULT] engine=cloudflare length=%d", len(result))
+        return result
     if BACKEND in ("local", "local_whisper"):  # local_whisper kept for backward compat
-        return _transcribe_local(wav_bytes)
+        log.debug("[ENGINE_START] engine=local_whisper")
+        result = _transcribe_local(wav_bytes)
+        _last_engine = "local_whisper"
+        log.debug("[ENGINE_RESULT] engine=local_whisper length=%d", len(result))
+        return result
     raise ValueError(f"Unknown BACKEND: {BACKEND!r}")
 
 
@@ -554,23 +604,52 @@ def _add_from_clipboard():
 # ---------------------------------------------------------------------------
 # Paste (preserves focus on active window)
 # ---------------------------------------------------------------------------
+def _clipboard_write(text: str, max_retries: int = 5, retry_delay_ms: int = 10) -> None:
+    """Copy text to clipboard with retry to survive Windows OpenClipboard lock contention."""
+    for attempt in range(max_retries):
+        try:
+            pyperclip.copy(text)
+            return
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay_ms / 1000)
+            else:
+                raise
+
+
 def paste_text(text: str):
-    global _pasting
+    global _pasting, _has_pasted, _last_paste_time
+    now = time.perf_counter()
+    with _lock:
+        if _has_pasted:
+            log.warning("[PASTE_EXECUTE] BLOCKED: double-paste guard triggered (already pasted this session)")
+            return
+        elapsed_ms = (now - _last_paste_time) * 1000
+        if elapsed_ms < _PASTE_COOLDOWN_MS:
+            log.warning("[PASTE_EXECUTE] BLOCKED: cooldown active (%.0fms since last paste, need %dms)",
+                        elapsed_ms, _PASTE_COOLDOWN_MS)
+            return
+        _has_pasted = True
+        _last_paste_time = now
     _pasting = True
     try:
-        pyperclip.copy(text)
+        _clipboard_write(text)
         pyautogui.hotkey("ctrl", "v")
     except Exception as exc:
         log.error("paste_text error: %s: %s", type(exc).__name__, exc)
         _pasting = False
         return
-    # Clear clipboard and release pasting guard after the Ctrl+V key state settles
+    log.info("[PASTE_EXECUTE] engine=%s length=%d chars", _last_engine or "?", len(text))
+    # Release pasting guard after the Ctrl+V key state settles.
+    # Clipboard clear is skipped when RESTORE_CLIPBOARD=false (default) to avoid
+    # the C-level crash that was occurring inside pyperclip's Windows API call.
     def _cleanup():
         global _pasting
-        try:
-            pyperclip.copy("")
-        except Exception as e:
-            log.warning("clipboard clear failed: %s", e)
+        if RESTORE_CLIPBOARD:
+            try:
+                _clipboard_write("")
+            except BaseException as e:  # BaseException catches C-ext errors too
+                log.warning("clipboard clear failed: %s: %s", type(e).__name__, e)
         _pasting = False
     threading.Timer(0.5, _cleanup).start()
 
@@ -598,7 +677,7 @@ def _auto_stop(indicator: Indicator):
 
 
 def _on_press(key, indicator: Indicator):
-    global _active, _record_timer, _mods_held
+    global _active, _record_timer, _mods_held, _last_press_time
     try:
         if key in _ALL_MOD_KEYS:
             _mods_held.add(key)
@@ -612,10 +691,18 @@ def _on_press(key, indicator: Indicator):
             return
         if _RECORD_MODS and not bool(_RECORD_MODS & _mods_held):
             return
+        now = time.perf_counter()
+        log.debug("[KEY_DOWN] key=%s ts=%.3f", key, now)
         with _lock:
+            elapsed_ms = (now - _last_press_time) * 1000
+            if elapsed_ms < _DEBOUNCE_MS:
+                log.debug("[KEY_DOWN] DEBOUNCED: %.1fms since last press (threshold %dms)",
+                          elapsed_ms, _DEBOUNCE_MS)
+                return
             if _active or _blocked_until_release or _pasting or _is_processing:
                 return
             _active = True
+            _last_press_time = now
         indicator.safe_set_state("recording")
         start_recording()
         _record_timer = threading.Timer(RECORD_MAX_SEC, _auto_stop, args=(indicator,))
@@ -633,6 +720,7 @@ def _on_release(key, indicator: Indicator):
             return
         if key != _RECORD_KEY:
             return
+        log.debug("[KEY_UP] key=%s ts=%.3f", key, time.perf_counter())
         with _lock:
             # Physical release always clears the block — do this before checking _active
             if _blocked_until_release:
@@ -653,7 +741,6 @@ def _on_release(key, indicator: Indicator):
 
 def _process_and_paste(indicator: Indicator):
     global _is_processing
-    import time  # noqa: PLC0415
     try:
         wav_bytes = stop_recording()
         if not wav_bytes:
@@ -678,6 +765,40 @@ def _process_and_paste(indicator: Indicator):
 
 
 # ---------------------------------------------------------------------------
+# Keyboard event worker — decouples pynput hook thread from all heavy work
+# ---------------------------------------------------------------------------
+def _keyboard_event_worker(indicator) -> None:
+    """Consume keyboard events from _event_queue so the Windows hook thread stays unblocked.
+
+    Windows terminates low-level keyboard hooks that don't return within HooksTimeout
+    (~200 ms by default). By dispatching through a queue the hook callbacks return
+    instantly; all real work happens here in a normal daemon thread.
+    """
+    while True:
+        try:
+            item = _event_queue.get()
+            if item is None:  # sentinel — shutdown requested
+                break
+            event_type, key = item
+            if event_type == "press":
+                _on_press(key, indicator)
+            elif event_type == "release":
+                _on_release(key, indicator)
+        except Exception as exc:
+            log.error("keyboard event worker error: %s: %s", type(exc).__name__, exc)
+
+
+def _hook_press(key) -> None:
+    """pynput on_press: enqueue event and return immediately to satisfy HooksTimeout."""
+    _event_queue.put(("press", key))
+
+
+def _hook_release(key) -> None:
+    """pynput on_release: enqueue event and return immediately to satisfy HooksTimeout."""
+    _event_queue.put(("release", key))
+
+
+# ---------------------------------------------------------------------------
 # Unhandled exception hooks — keep the process alive and log to file
 # ---------------------------------------------------------------------------
 def _log_unhandled_exception(exc_type, exc_value, exc_tb):
@@ -686,6 +807,8 @@ def _log_unhandled_exception(exc_type, exc_value, exc_tb):
         sys.__excepthook__(exc_type, exc_value, exc_tb)
         return
     log.critical("Unhandled exception", exc_info=(exc_type, exc_value, exc_tb))
+    for handler in logging.getLogger().handlers:
+        handler.flush()
 
 
 def _log_thread_exception(args):
@@ -724,10 +847,12 @@ def main():
     _check_backend_config()
     indicator = Indicator()
 
-    listener = keyboard.Listener(
-        on_press=lambda key: _on_press(key, indicator),
-        on_release=lambda key: _on_release(key, indicator),
+    worker = threading.Thread(
+        target=_keyboard_event_worker, args=(indicator,), daemon=True, name="keyboard-worker",
     )
+    worker.start()
+
+    listener = keyboard.Listener(on_press=_hook_press, on_release=_hook_release)
     listener.start()
     log.info("voice-fep v%s ready (%s) — %s to record, %s to add dict — right-click to quit",
              APP_VERSION, _backend_info(), HOTKEY, DICT_HOTKEY)
@@ -735,6 +860,7 @@ def main():
     try:
         indicator.mainloop()
     finally:
+        _event_queue.put(None)  # signal keyboard worker to stop
         listener.stop()
         log.info("voice-fep stopped")
 

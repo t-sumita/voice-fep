@@ -2,6 +2,7 @@
 import io
 import logging
 import sys
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -245,6 +246,7 @@ class TestWhisperAPICompatibility:
 
 class TestPasteText:
     def test_copies_to_clipboard_and_pastes(self, monkeypatch):
+        monkeypatch.setattr(main, "_has_pasted", False)
         copied: list = []
         monkeypatch.setattr(main.pyperclip, "copy", lambda t: copied.append(t))
         hotkey_calls: list = []
@@ -256,7 +258,9 @@ class TestPasteText:
         assert ("ctrl", "v") in hotkey_calls
 
     def test_clipboard_cleared_after_paste(self, monkeypatch):
-        """S-4: clipboard must be cleared after paste."""
+        """S-4: clipboard must be cleared after paste when RESTORE_CLIPBOARD=True."""
+        monkeypatch.setattr(main, "_has_pasted", False)
+        monkeypatch.setattr(main, "RESTORE_CLIPBOARD", True)
         cleared: list = []
         call_order: list = []
 
@@ -271,7 +275,6 @@ class TestPasteText:
         main.paste_text("secret text")
 
         # Wait for the 0.5s timer
-        import time
         time.sleep(0.7)
 
         assert cleared, "Clipboard was never cleared after paste (S-4 violation)"
@@ -305,6 +308,7 @@ class TestTimingLog:
         import logging
         monkeypatch.setattr(main, "_audio_chunks", [])
         monkeypatch.setattr(main, "_stream", None)
+        monkeypatch.setattr(main, "_has_pasted", False)
         # stop_recording returns None → _process_and_paste exits early (no API call)
         # Use a stub that injects wav bytes to exercise the timing path
         wav = _make_wav_bytes()
@@ -970,6 +974,7 @@ class TestPasteGuard:
 
     def test_pasting_flag_set_on_paste_text(self, monkeypatch):
         monkeypatch.setattr(main, "_pasting", False)
+        monkeypatch.setattr(main, "_has_pasted", False)
         monkeypatch.setattr(main.pyperclip, "copy", lambda _: None)
         monkeypatch.setattr(main.pyautogui, "hotkey", lambda *a: None)
         timers: list = []
@@ -979,10 +984,11 @@ class TestPasteGuard:
         assert main._pasting is True, "_pasting must be True immediately after paste_text is called"
 
     def test_pasting_flag_cleared_by_cleanup(self, monkeypatch):
-        """The cleanup closure passed to Timer must reset _pasting and clear clipboard."""
+        """The cleanup closure passed to Timer must reset _pasting."""
         monkeypatch.setattr(main, "_pasting", False)
-        cleared: list = []
-        monkeypatch.setattr(main.pyperclip, "copy", lambda v: cleared.append(v))
+        monkeypatch.setattr(main, "_has_pasted", False)
+        monkeypatch.setattr(main, "RESTORE_CLIPBOARD", False)
+        monkeypatch.setattr(main.pyperclip, "copy", lambda v: None)
         monkeypatch.setattr(main.pyautogui, "hotkey", lambda *a: None)
         cleanup_fns: list = []
 
@@ -996,7 +1002,6 @@ class TestPasteGuard:
         assert cleanup_fns, "Timer must have been created"
         cleanup_fns[0]()  # simulate timer firing
         assert main._pasting is False, "_pasting must be False after cleanup"
-        assert "" in cleared, "clipboard must be cleared by cleanup"
 
     def test_pasting_flag_in_source(self):
         src = (Path(__file__).parent.parent / "main.py").read_text(encoding="utf-8")
@@ -1237,6 +1242,7 @@ class TestCrashResilience:
     def test_paste_text_clipboard_error_caught(self, monkeypatch, caplog):
         """If pyperclip.copy raises, paste_text must log the error and clear _pasting."""
         monkeypatch.setattr(main, "_pasting", False)
+        monkeypatch.setattr(main, "_has_pasted", False)
         monkeypatch.setattr(main.pyperclip, "copy", lambda _: (_ for _ in ()).throw(OSError("clipboard locked")))
         import logging
         with caplog.at_level(logging.ERROR, logger="voice-fep"):
@@ -1254,6 +1260,8 @@ class TestCrashResilience:
                 raise OSError("clipboard locked on clear")
 
         monkeypatch.setattr(main, "_pasting", False)
+        monkeypatch.setattr(main, "_has_pasted", False)
+        monkeypatch.setattr(main, "RESTORE_CLIPBOARD", True)
         monkeypatch.setattr(main.pyperclip, "copy", _copy)
         monkeypatch.setattr(main.pyautogui, "hotkey", lambda *a: None)
         cleanup_fns: list = []
@@ -1284,3 +1292,558 @@ class TestCrashResilience:
         assert "threading.excepthook" in src
         assert "_log_unhandled_exception" in src
         assert "_log_thread_exception" in src
+
+
+class TestHasPasted:
+    """_has_pasted one-shot guard prevents paste_text from executing more than once per session."""
+
+    def test_flag_exists(self):
+        assert hasattr(main, "_has_pasted")
+
+    def test_first_call_executes(self, monkeypatch):
+        """paste_text must execute when _has_pasted is False."""
+        monkeypatch.setattr(main, "_has_pasted", False)
+        copied: list = []
+        monkeypatch.setattr(main.pyperclip, "copy", lambda v: copied.append(v))
+        monkeypatch.setattr(main.pyautogui, "hotkey", lambda *a: None)
+        cleanup_fns: list = []
+
+        class _FT:
+            def __init__(self, d, fn): cleanup_fns.append(fn)
+            def start(self): pass
+
+        monkeypatch.setattr(main.threading, "Timer", _FT)
+        main.paste_text("テスト")
+        assert copied[0] == "テスト", "First call must copy text to clipboard"
+
+    def test_second_call_blocked(self, monkeypatch, caplog):
+        """paste_text must be blocked if _has_pasted is already True."""
+        import logging
+        monkeypatch.setattr(main, "_has_pasted", True)
+        copied: list = []
+        monkeypatch.setattr(main.pyperclip, "copy", lambda v: copied.append(v))
+        with caplog.at_level(logging.WARNING, logger="voice-fep"):
+            main.paste_text("二重ペーストテスト")
+        assert not copied, "Second paste must be blocked when _has_pasted is True"
+        assert any("PASTE_EXECUTE" in r.message for r in caplog.records)
+        assert any("BLOCKED" in r.message for r in caplog.records)
+
+    def test_flag_set_after_first_paste(self, monkeypatch):
+        """After a successful paste, _has_pasted must be True."""
+        monkeypatch.setattr(main, "_has_pasted", False)
+        monkeypatch.setattr(main.pyperclip, "copy", lambda _: None)
+        monkeypatch.setattr(main.pyautogui, "hotkey", lambda *a: None)
+        cleanup_fns: list = []
+
+        class _FT:
+            def __init__(self, d, fn): cleanup_fns.append(fn)
+            def start(self): pass
+
+        monkeypatch.setattr(main.threading, "Timer", _FT)
+        main.paste_text("テスト")
+        assert main._has_pasted is True, "_has_pasted must be True after first paste"
+
+    def test_flag_reset_by_start_recording(self, monkeypatch):
+        """start_recording must reset _has_pasted to False for the next session."""
+        monkeypatch.setattr(main, "_has_pasted", True)
+        monkeypatch.setattr(main, "_stream", None)
+
+        class _FakeStream:
+            def start(self): pass
+
+        monkeypatch.setattr(main.sd, "InputStream", lambda **_: _FakeStream())
+        main.start_recording()
+        assert main._has_pasted is False, "start_recording must reset _has_pasted"
+        main._stream = None
+
+    def test_paste_execute_log_emitted(self, monkeypatch, caplog):
+        """[PASTE_EXECUTE] log line must be emitted on successful paste."""
+        import logging
+        monkeypatch.setattr(main, "_has_pasted", False)
+        monkeypatch.setattr(main, "_last_engine", "gemini")
+        monkeypatch.setattr(main.pyperclip, "copy", lambda _: None)
+        monkeypatch.setattr(main.pyautogui, "hotkey", lambda *a: None)
+        cleanup_fns: list = []
+
+        class _FT:
+            def __init__(self, d, fn): cleanup_fns.append(fn)
+            def start(self): pass
+
+        monkeypatch.setattr(main.threading, "Timer", _FT)
+        with caplog.at_level(logging.INFO, logger="voice-fep"):
+            main.paste_text("テスト")
+        assert any("[PASTE_EXECUTE]" in r.message for r in caplog.records)
+        assert any("gemini" in r.message for r in caplog.records)
+
+
+class TestDebugLog:
+    """Verify structured debug log labels and fallback logic are present in source."""
+
+    def _src(self) -> str:
+        return (Path(__file__).parent.parent / "main.py").read_text(encoding="utf-8")
+
+    def test_key_down_label_in_source(self):
+        assert "[KEY_DOWN]" in self._src()
+
+    def test_key_up_label_in_source(self):
+        assert "[KEY_UP]" in self._src()
+
+    def test_record_start_label_in_source(self):
+        assert "[RECORD_START]" in self._src()
+
+    def test_record_stop_label_in_source(self):
+        assert "[RECORD_STOP]" in self._src()
+
+    def test_engine_start_label_in_source(self):
+        assert "[ENGINE_START]" in self._src()
+
+    def test_engine_result_label_in_source(self):
+        assert "[ENGINE_RESULT]" in self._src()
+
+    def test_paste_execute_label_in_source(self):
+        assert "[PASTE_EXECUTE]" in self._src()
+
+    def test_gemini_fallback_in_source(self):
+        """Gemini→Whisper serial fallback must exist in transcribe()."""
+        assert "falling back to local Whisper" in self._src()
+
+    def test_cloud_badge_in_source(self):
+        """☁ cloud badge must be rendered for Gemini mode in _draw_mic."""
+        assert "☁" in self._src()
+
+    def test_flush_in_exception_hook(self):
+        """_log_unhandled_exception must flush handlers to avoid lost log lines on crash."""
+        assert "handler.flush()" in self._src()
+
+    def test_gemini_fallback_routes_to_local(self, monkeypatch):
+        """When Gemini raises, transcribe() must silently fall back to local Whisper."""
+        monkeypatch.setattr(main, "BACKEND", "gemini")
+        monkeypatch.setattr(main, "_transcribe_gemini", lambda _: (_ for _ in ()).throw(RuntimeError("api down")))
+        stub_local = MagicMock(return_value="ローカル認識")
+        monkeypatch.setattr(main, "_transcribe_local", stub_local)
+        result = main.transcribe(b"dummy")
+        stub_local.assert_called_once_with(b"dummy")
+        assert result == "ローカル認識"
+        assert main._last_engine == "local_whisper(fallback)"
+
+    def test_last_engine_set_for_gemini(self, monkeypatch):
+        """_last_engine must be 'gemini' after a successful Gemini call."""
+        monkeypatch.setattr(main, "BACKEND", "gemini")
+        monkeypatch.setattr(main, "_transcribe_gemini", lambda _: "test")
+        main.transcribe(b"dummy")
+        assert main._last_engine == "gemini"
+
+    def test_last_engine_set_for_local(self, monkeypatch):
+        """_last_engine must be 'local_whisper' after a local call."""
+        monkeypatch.setattr(main, "BACKEND", "local")
+        monkeypatch.setattr(main, "_transcribe_local", lambda _: "test")
+        main.transcribe(b"dummy")
+        assert main._last_engine == "local_whisper"
+
+    def test_faulthandler_in_source(self):
+        """faulthandler.enable must be present to catch C-level segfaults."""
+        src = self._src()
+        assert "import faulthandler" in src
+        assert "faulthandler.enable" in src
+
+
+class TestKeyboardHookQueue:
+    """_hook_press/_hook_release must enqueue events and return without blocking."""
+
+    def test_hook_functions_exist(self):
+        assert hasattr(main, "_hook_press")
+        assert hasattr(main, "_hook_release")
+        assert hasattr(main, "_keyboard_event_worker")
+        assert hasattr(main, "_event_queue")
+
+    def test_hook_press_enqueues_event(self, monkeypatch):
+        import queue as _queue
+        q = _queue.SimpleQueue()
+        monkeypatch.setattr(main, "_event_queue", q)
+        main._hook_press("dummy_key")
+        assert not q.empty()
+        assert q.get_nowait() == ("press", "dummy_key")
+
+    def test_hook_release_enqueues_event(self, monkeypatch):
+        import queue as _queue
+        q = _queue.SimpleQueue()
+        monkeypatch.setattr(main, "_event_queue", q)
+        main._hook_release("dummy_key")
+        assert not q.empty()
+        assert q.get_nowait() == ("release", "dummy_key")
+
+    def test_hook_press_returns_quickly(self, monkeypatch):
+        """_hook_press must not block — must return in under 5 ms."""
+        import queue as _queue
+        monkeypatch.setattr(main, "_event_queue", _queue.SimpleQueue())
+        t0 = time.perf_counter()
+        main._hook_press("test_key")
+        assert (time.perf_counter() - t0) < 0.005
+
+    def test_hook_release_returns_quickly(self, monkeypatch):
+        """_hook_release must not block — must return in under 5 ms."""
+        import queue as _queue
+        monkeypatch.setattr(main, "_event_queue", _queue.SimpleQueue())
+        t0 = time.perf_counter()
+        main._hook_release("test_key")
+        assert (time.perf_counter() - t0) < 0.005
+
+    def test_worker_dispatches_press_to_on_press(self, monkeypatch):
+        """Worker must call _on_press for 'press' events."""
+        import queue as _queue
+        calls: list = []
+        q = _queue.SimpleQueue()
+        monkeypatch.setattr(main, "_event_queue", q)
+        monkeypatch.setattr(main, "_on_press", lambda k, ind: calls.append(("press", k)))
+
+        class _FI:
+            def safe_set_state(self, _): pass
+
+        q.put(("press", "space"))
+        q.put(None)  # sentinel
+        main._keyboard_event_worker(_FI())
+        assert calls == [("press", "space")]
+
+    def test_worker_dispatches_release_to_on_release(self, monkeypatch):
+        """Worker must call _on_release for 'release' events."""
+        import queue as _queue
+        calls: list = []
+        q = _queue.SimpleQueue()
+        monkeypatch.setattr(main, "_event_queue", q)
+        monkeypatch.setattr(main, "_on_release", lambda k, ind: calls.append(("release", k)))
+
+        class _FI:
+            def safe_set_state(self, _): pass
+
+        q.put(("release", "space"))
+        q.put(None)
+        main._keyboard_event_worker(_FI())
+        assert calls == [("release", "space")]
+
+    def test_worker_stops_on_sentinel(self, monkeypatch):
+        """Worker must exit the loop when it receives None."""
+        import queue as _queue
+        q = _queue.SimpleQueue()
+        monkeypatch.setattr(main, "_event_queue", q)
+        q.put(None)
+
+        class _FI:
+            def safe_set_state(self, _): pass
+
+        # If worker hangs, the test times out — just verify it returns
+        main._keyboard_event_worker(_FI())
+
+    def test_hook_functions_in_source(self):
+        src = (Path(__file__).parent.parent / "main.py").read_text(encoding="utf-8")
+        assert "_hook_press" in src
+        assert "_hook_release" in src
+        assert "_keyboard_event_worker" in src
+        assert "HooksTimeout" in src
+
+
+class TestClipboardRetry:
+    """_clipboard_write retries on Windows lock contention, raises after exhaustion."""
+
+    def test_succeeds_on_first_try(self, monkeypatch):
+        calls: list = []
+        monkeypatch.setattr(main.pyperclip, "copy", lambda v: calls.append(v))
+        main._clipboard_write("テスト")
+        assert calls == ["テスト"]
+
+    def test_retries_on_transient_failure(self, monkeypatch):
+        """Should succeed without raising if failure clears within max_retries."""
+        call_count = [0]
+
+        def _flaky(v):
+            call_count[0] += 1
+            if call_count[0] < 3:
+                raise OSError("clipboard locked")
+
+        monkeypatch.setattr(main.pyperclip, "copy", _flaky)
+        main._clipboard_write("テスト", max_retries=5, retry_delay_ms=0)
+        assert call_count[0] == 3
+
+    def test_raises_after_max_retries_exhausted(self, monkeypatch):
+        monkeypatch.setattr(
+            main.pyperclip, "copy",
+            lambda _: (_ for _ in ()).throw(OSError("always locked")),
+        )
+        with pytest.raises(OSError):
+            main._clipboard_write("テスト", max_retries=3, retry_delay_ms=0)
+
+    def test_retry_count_equals_max_retries(self, monkeypatch):
+        """Exactly max_retries attempts must be made before raising."""
+        calls: list = []
+
+        def _always_fail(v):
+            calls.append(v)
+            raise OSError("locked")
+
+        monkeypatch.setattr(main.pyperclip, "copy", _always_fail)
+        with pytest.raises(OSError):
+            main._clipboard_write("テスト", max_retries=4, retry_delay_ms=0)
+        assert len(calls) == 4
+
+    def test_used_in_paste_text(self):
+        src = (Path(__file__).parent.parent / "main.py").read_text(encoding="utf-8")
+        assert "_clipboard_write(text)" in src
+        assert '_clipboard_write("")' in src
+
+
+class TestRestoreClipboard:
+    """RESTORE_CLIPBOARD flag controls post-paste clipboard clearing."""
+
+    def test_flag_exists_and_defaults_false(self):
+        """RESTORE_CLIPBOARD must default to False to prevent crash-inducing clear."""
+        assert hasattr(main, "RESTORE_CLIPBOARD")
+        # Default (no env var) must be False
+        import importlib, os
+        old = os.environ.pop("RESTORE_CLIPBOARD", None)
+        try:
+            importlib.reload(main)
+            assert main.RESTORE_CLIPBOARD is False, "RESTORE_CLIPBOARD must default to False"
+        finally:
+            if old is not None:
+                os.environ["RESTORE_CLIPBOARD"] = old
+            importlib.reload(main)
+
+    def test_flag_true_via_env(self, monkeypatch):
+        """RESTORE_CLIPBOARD=true in env must set flag to True."""
+        import importlib
+        monkeypatch.setenv("RESTORE_CLIPBOARD", "true")
+        importlib.reload(main)
+        assert main.RESTORE_CLIPBOARD is True
+        monkeypatch.delenv("RESTORE_CLIPBOARD", raising=False)
+        importlib.reload(main)
+
+    def test_clipboard_not_cleared_when_false(self, monkeypatch):
+        """When RESTORE_CLIPBOARD=False, cleanup must not call pyperclip.copy."""
+        monkeypatch.setattr(main, "_has_pasted", False)
+        monkeypatch.setattr(main, "RESTORE_CLIPBOARD", False)
+        copy_calls: list = []
+        monkeypatch.setattr(main.pyperclip, "copy", lambda v: copy_calls.append(v))
+        monkeypatch.setattr(main.pyautogui, "hotkey", lambda *a: None)
+        cleanup_fns: list = []
+
+        class _FT:
+            def __init__(self, d, fn): cleanup_fns.append(fn)
+            def start(self): pass
+
+        monkeypatch.setattr(main.threading, "Timer", _FT)
+        main.paste_text("テスト")
+        cleanup_fns[0]()  # fire cleanup
+        assert copy_calls == ["テスト"], "Only the initial write must occur; no clipboard clear"
+
+    def test_clipboard_cleared_when_true(self, monkeypatch):
+        """When RESTORE_CLIPBOARD=True, cleanup must call pyperclip.copy with empty string."""
+        monkeypatch.setattr(main, "_has_pasted", False)
+        monkeypatch.setattr(main, "RESTORE_CLIPBOARD", True)
+        copy_calls: list = []
+        monkeypatch.setattr(main.pyperclip, "copy", lambda v: copy_calls.append(v))
+        monkeypatch.setattr(main.pyautogui, "hotkey", lambda *a: None)
+        cleanup_fns: list = []
+
+        class _FT:
+            def __init__(self, d, fn): cleanup_fns.append(fn)
+            def start(self): pass
+
+        monkeypatch.setattr(main.threading, "Timer", _FT)
+        main.paste_text("テスト")
+        cleanup_fns[0]()  # fire cleanup
+        assert "" in copy_calls, "Clipboard must be cleared when RESTORE_CLIPBOARD=True"
+
+    def test_pasting_reset_regardless_of_flag(self, monkeypatch):
+        """_pasting must be reset to False by cleanup whether RESTORE_CLIPBOARD is True or False."""
+        for flag in (True, False):
+            monkeypatch.setattr(main, "_has_pasted", False)
+            main._last_paste_time = 0.0
+            monkeypatch.setattr(main, "RESTORE_CLIPBOARD", flag)
+            monkeypatch.setattr(main, "_pasting", False)
+            monkeypatch.setattr(main.pyperclip, "copy", lambda _: None)
+            monkeypatch.setattr(main.pyautogui, "hotkey", lambda *a: None)
+            cleanup_fns: list = []
+
+            class _FT:
+                def __init__(self, d, fn): cleanup_fns.append(fn)
+                def start(self): pass
+
+            monkeypatch.setattr(main.threading, "Timer", _FT)
+            main.paste_text("テスト")
+            cleanup_fns[0]()
+            assert main._pasting is False, f"_pasting not reset when RESTORE_CLIPBOARD={flag}"
+
+    def test_base_exception_caught_in_cleanup(self, monkeypatch, caplog):
+        """BaseException from clipboard clear must be caught and logged, not propagated."""
+        import logging
+        monkeypatch.setattr(main, "_has_pasted", False)
+        monkeypatch.setattr(main, "RESTORE_CLIPBOARD", True)
+
+        call_n = [0]
+        def _boom(v):
+            call_n[0] += 1
+            if call_n[0] > 1:
+                raise MemoryError("C-level OOM")
+
+        monkeypatch.setattr(main.pyperclip, "copy", _boom)
+        monkeypatch.setattr(main.pyautogui, "hotkey", lambda *a: None)
+        cleanup_fns: list = []
+
+        class _FT:
+            def __init__(self, d, fn): cleanup_fns.append(fn)
+            def start(self): pass
+
+        monkeypatch.setattr(main.threading, "Timer", _FT)
+        main.paste_text("テスト")
+        with caplog.at_level(logging.WARNING, logger="voice-fep"):
+            cleanup_fns[0]()  # MemoryError raised inside _clipboard_write
+        assert main._pasting is False, "_pasting must be reset even after BaseException"
+        assert any("clipboard clear failed" in r.message for r in caplog.records)
+
+
+class TestFaulthandlerPlacement:
+    """faulthandler must be enabled before any other import to catch early crashes."""
+
+    def _src(self) -> str:
+        return (Path(__file__).parent.parent / "main.py").read_text(encoding="utf-8")
+
+    def test_faulthandler_before_argparse(self):
+        """faulthandler.enable must appear before 'import argparse' in source."""
+        src = self._src()
+        fh_pos = src.index("faulthandler.enable")
+        argparse_pos = src.index("import argparse")
+        assert fh_pos < argparse_pos, (
+            "faulthandler.enable must be the very first action in main.py"
+        )
+
+    def test_crash_dump_log_name(self):
+        """crash_dump.log must be the filename used for faulthandler output."""
+        assert 'open("crash_dump.log"' in self._src()
+
+    def test_safe_set_state_uses_after(self):
+        """safe_set_state must schedule via after() — never call set_state directly."""
+        src = self._src()
+        assert "self.after(0, lambda: self.set_state(state))" in src
+
+    def test_restore_clipboard_in_source(self):
+        src = self._src()
+        assert "RESTORE_CLIPBOARD" in src
+        assert "BaseException" in src
+
+
+class TestDebounce:
+    """Debounce gate: press events within _DEBOUNCE_MS of last accepted press are dropped."""
+
+    def test_debounce_constants_defined(self):
+        assert hasattr(main, "_DEBOUNCE_MS")
+        assert main._DEBOUNCE_MS == 300
+
+    def test_last_press_time_initialized_zero(self):
+        assert main._last_press_time == 0.0
+
+    def test_second_press_within_debounce_dropped(self, monkeypatch):
+        """Simulate two press events 50ms apart — second must be ignored."""
+        from pynput import keyboard as kb
+        calls = []
+
+        def fake_start():
+            calls.append("start")
+
+        monkeypatch.setattr(main, "start_recording", fake_start)
+        monkeypatch.setattr(main, "_active", False)
+        monkeypatch.setattr(main, "_blocked_until_release", False)
+        monkeypatch.setattr(main, "_pasting", False)
+        monkeypatch.setattr(main, "_is_processing", False)
+        monkeypatch.setattr(main, "_mods_held", {kb.Key.ctrl_l})
+
+        indicator = MagicMock()
+        indicator.safe_set_state = MagicMock()
+
+        # First press — accepted
+        main._last_press_time = 0.0
+        main._on_press(main._RECORD_KEY, indicator)
+        assert len(calls) == 1
+
+        # Reset active so the second press would normally proceed
+        main._active = False
+
+        # Second press 50ms later — within _DEBOUNCE_MS → must be dropped
+        main._last_press_time = time.perf_counter()
+        time.sleep(0.05)
+        main._on_press(main._RECORD_KEY, indicator)
+        assert len(calls) == 1, "Second press within debounce window should be dropped"
+
+    def test_press_after_debounce_accepted(self, monkeypatch):
+        """Press event arriving after _DEBOUNCE_MS has elapsed must be accepted."""
+        from pynput import keyboard as kb
+        calls = []
+
+        def fake_start():
+            calls.append("start")
+
+        monkeypatch.setattr(main, "start_recording", fake_start)
+        monkeypatch.setattr(main, "_active", False)
+        monkeypatch.setattr(main, "_blocked_until_release", False)
+        monkeypatch.setattr(main, "_pasting", False)
+        monkeypatch.setattr(main, "_is_processing", False)
+        monkeypatch.setattr(main, "_mods_held", {kb.Key.ctrl_l})
+
+        indicator = MagicMock()
+        indicator.safe_set_state = MagicMock()
+
+        # Set last press time to well before debounce threshold
+        main._last_press_time = time.perf_counter() - (main._DEBOUNCE_MS / 1000 + 0.1)
+        main._on_press(main._RECORD_KEY, indicator)
+        assert len(calls) == 1, "Press after debounce window must be accepted"
+
+    def test_last_press_time_in_source(self):
+        src = (Path(__file__).parent.parent / "main.py").read_text(encoding="utf-8")
+        assert "_last_press_time" in src
+        assert "_DEBOUNCE_MS" in src
+
+
+class TestPasteCooldown:
+    """Paste cooldown gate: paste requests within _PASTE_COOLDOWN_MS of last paste are dropped."""
+
+    def test_paste_cooldown_constant_defined(self):
+        assert hasattr(main, "_PASTE_COOLDOWN_MS")
+        assert main._PASTE_COOLDOWN_MS == 500
+
+    def test_last_paste_time_initialized_zero(self):
+        assert main._last_paste_time == 0.0
+
+    def test_paste_blocked_within_cooldown(self, monkeypatch):
+        """Second paste attempt within _PASTE_COOLDOWN_MS must be blocked."""
+        pasted = []
+        monkeypatch.setattr("pyperclip.copy", lambda t: None)
+        monkeypatch.setattr("pyautogui.hotkey", lambda *a: pasted.append(a))
+        monkeypatch.setattr(main, "RESTORE_CLIPBOARD", False)
+
+        # First paste succeeds
+        main._last_paste_time = 0.0
+        main._has_pasted = False
+        main.paste_text("first")
+        assert len(pasted) == 1
+
+        # Immediately try again — cooldown active, _has_pasted also set
+        # Reset _has_pasted to test cooldown independently
+        main._has_pasted = False
+        main.paste_text("second")
+        assert len(pasted) == 1, "Paste within cooldown window must be blocked"
+
+    def test_paste_allowed_after_cooldown(self, monkeypatch):
+        """Paste attempt after _PASTE_COOLDOWN_MS has elapsed must succeed."""
+        pasted = []
+        monkeypatch.setattr("pyperclip.copy", lambda t: None)
+        monkeypatch.setattr("pyautogui.hotkey", lambda *a: pasted.append(a))
+        monkeypatch.setattr(main, "RESTORE_CLIPBOARD", False)
+
+        # Set last paste time to well before cooldown threshold
+        main._last_paste_time = time.perf_counter() - (main._PASTE_COOLDOWN_MS / 1000 + 0.1)
+        main._has_pasted = False
+        main.paste_text("after cooldown")
+        assert len(pasted) == 1, "Paste after cooldown window must be accepted"
+
+    def test_paste_cooldown_in_source(self):
+        src = (Path(__file__).parent.parent / "main.py").read_text(encoding="utf-8")
+        assert "_last_paste_time" in src
+        assert "_PASTE_COOLDOWN_MS" in src
