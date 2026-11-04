@@ -62,7 +62,7 @@ class TestConfig:
 
     def test_app_version_defined(self):
         assert hasattr(main, "APP_VERSION")
-        assert main.APP_VERSION == "0.8.7"
+        assert main.APP_VERSION == "0.8.8"
 
     def test_default_backend_is_gemini(self, monkeypatch):
         monkeypatch.delenv("BACKEND", raising=False)
@@ -112,4 +112,18 @@ class TestGeminiConfig:
         src = self._src()
         # Verify the error log emits both type name and str(exc), not just type name
         assert "type(exc).__name__, exc" in src
+
+    def test_function_calling_disabled(self):
+        """FunctionCallingConfig mode=NONE must be set — prevents AFC 20s retry loop."""
+        src = self._src()
+        assert "FunctionCallingConfig" in src
+        assert 'mode="NONE"' in src
+
+    def test_generation_config_temperature(self):
+        """temperature=0.0 must be set for deterministic, fastest token selection."""
+        assert "temperature=0.0" in self._src()
+
+    def test_generation_config_max_output_tokens(self):
+        """max_output_tokens must be set to cap response and reduce latency."""
+        assert "max_output_tokens" in self._src()
 

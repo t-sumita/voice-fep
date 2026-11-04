@@ -79,7 +79,7 @@ def _get_log_path() -> Path:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION: str = "0.8.7"
+APP_VERSION: str = "0.8.8"
 GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 BACKEND: str = os.environ.get("BACKEND", "gemini")
@@ -464,7 +464,16 @@ def _transcribe_gemini(wav_bytes: bytes) -> str:
                 types.Part(text="上記の音声を書き起こしてください。"),
             ])
         ],
-        config=types.GenerateContentConfig(system_instruction=_build_system_prompt()),
+        config=types.GenerateContentConfig(
+            system_instruction=_build_system_prompt(),
+            temperature=0.0,
+            max_output_tokens=512,
+            # Disable server-side function calling so the model never emits tool_call parts.
+            # This prevents AFC (Automatic Function Calling) from retrying and adding ~20s latency.
+            tool_config=types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode="NONE"),
+            ),
+        ),
     )
     return (response.text or "").strip()
 
