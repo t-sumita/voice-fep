@@ -1735,7 +1735,7 @@ class TestDebounce:
 
     def test_debounce_constants_defined(self):
         assert hasattr(main, "_DEBOUNCE_MS")
-        assert main._DEBOUNCE_MS == 300
+        assert main._DEBOUNCE_MS == 400
 
     def test_last_press_time_initialized_zero(self):
         assert main._last_press_time == 0.0
@@ -1799,6 +1799,77 @@ class TestDebounce:
         src = (Path(__file__).parent.parent / "main.py").read_text(encoding="utf-8")
         assert "_last_press_time" in src
         assert "_DEBOUNCE_MS" in src
+
+
+class TestConcurrentPress:
+    """3 threads call _on_press simultaneously — only 1 recording must start.
+
+    This tests the physical chatter guard: the lock + now-inside-lock design must
+    make elapsed ≈ 0 for threads 2 and 3, so the debounce gate catches them even
+    when _active is not yet visible across threads.
+    """
+
+    def test_concurrent_press_only_one_recording(self, monkeypatch):
+        from pynput import keyboard as kb
+        import threading
+
+        calls = []
+        monkeypatch.setattr(main, "start_recording", lambda: calls.append(1))
+        monkeypatch.setattr(main, "_active", False)
+        monkeypatch.setattr(main, "_blocked_until_release", False)
+        monkeypatch.setattr(main, "_pasting", False)
+        monkeypatch.setattr(main, "_is_processing", False)
+        monkeypatch.setattr(main, "_mods_held", {kb.Key.ctrl_l})
+
+        indicator = MagicMock()
+        indicator.safe_set_state = MagicMock()
+
+        # Barrier synchronises all 3 threads to fire simultaneously
+        barrier = threading.Barrier(3)
+
+        def press():
+            barrier.wait()
+            main._on_press(main._RECORD_KEY, indicator)
+
+        threads = [threading.Thread(target=press) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert len(calls) == 1, f"Expected exactly 1 recording start, got {len(calls)}"
+
+    def test_concurrent_press_active_set_once(self, monkeypatch):
+        """_active must be True (exactly once set) after concurrent presses."""
+        from pynput import keyboard as kb
+        import threading
+
+        monkeypatch.setattr(main, "start_recording", lambda: None)
+        monkeypatch.setattr(main, "_active", False)
+        monkeypatch.setattr(main, "_blocked_until_release", False)
+        monkeypatch.setattr(main, "_pasting", False)
+        monkeypatch.setattr(main, "_is_processing", False)
+        monkeypatch.setattr(main, "_mods_held", {kb.Key.ctrl_l})
+
+        indicator = MagicMock()
+        indicator.safe_set_state = MagicMock()
+
+        barrier = threading.Barrier(3)
+        active_snapshots = []
+
+        def press():
+            barrier.wait()
+            main._on_press(main._RECORD_KEY, indicator)
+            active_snapshots.append(main._active)
+
+        threads = [threading.Thread(target=press) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        # _active must be True (the one accepted press set it)
+        assert main._active is True, "_active must be True after one accepted press"
 
 
 class TestPasteCooldown:

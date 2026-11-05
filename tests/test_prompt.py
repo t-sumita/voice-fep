@@ -62,7 +62,7 @@ class TestConfig:
 
     def test_app_version_defined(self):
         assert hasattr(main, "APP_VERSION")
-        assert main.APP_VERSION == "0.8.8"
+        assert main.APP_VERSION == "0.8.9"
 
     def test_default_backend_is_gemini(self, monkeypatch):
         monkeypatch.delenv("BACKEND", raising=False)
@@ -103,9 +103,16 @@ class TestGeminiConfig:
         assert "thinking_config" not in self._src()
         assert "ThinkingConfig" not in self._src()
 
-    def test_no_afc_config_in_source(self):
-        """AutomaticFunctionCallingConfig caused 400 on some models — must be absent."""
-        assert "AutomaticFunctionCallingConfig" not in self._src()
+    def test_afc_explicitly_disabled(self):
+        """AFC must be disabled via AutomaticFunctionCallingConfig(disable=True).
+
+        AutomaticFunctionCallingConfig is SDK-client-only and never sent to the API,
+        so there is no 400-error risk. Without disable=True the SDK's AFC loop retries
+        up to 10 times on any tool_call response, adding ~20s latency.
+        """
+        src = self._src()
+        assert "AutomaticFunctionCallingConfig" in src
+        assert "disable=True" in src
 
     def test_error_log_includes_exception_detail(self):
         """ClientError message must be logged so root cause is immediately visible."""

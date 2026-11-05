@@ -79,7 +79,7 @@ def _get_log_path() -> Path:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_VERSION: str = "0.8.8"
+APP_VERSION: str = "0.8.9"
 GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 BACKEND: str = os.environ.get("BACKEND", "gemini")
@@ -95,7 +95,7 @@ DICT_HOTKEY: str = os.environ.get("DICT_HOTKEY", "shift+space")
 # Set RESTORE_CLIPBOARD=true in .env to re-enable the post-paste clipboard clear (S-4).
 RESTORE_CLIPBOARD: bool = os.environ.get("RESTORE_CLIPBOARD", "false").lower() in ("true", "1", "yes")
 # Hotkey chatter guard: press events arriving within this window of the last accepted press are dropped.
-_DEBOUNCE_MS: int = 300
+_DEBOUNCE_MS: int = 400
 # Paste cooldown: paste requests within this window of the last paste are dropped.
 _PASTE_COOLDOWN_MS: int = 500
 _RECORD_KEY, _RECORD_MODS = _parse_hotkey(HOTKEY)
@@ -468,8 +468,10 @@ def _transcribe_gemini(wav_bytes: bytes) -> str:
             system_instruction=_build_system_prompt(),
             temperature=0.0,
             max_output_tokens=512,
-            # Disable server-side function calling so the model never emits tool_call parts.
-            # This prevents AFC (Automatic Function Calling) from retrying and adding ~20s latency.
+            # Disable client-side AFC loop (SDK retries up to 10x on tool_call responses → 20s lag).
+            # AutomaticFunctionCallingConfig is SDK-only and not sent to the API, so no 400 risk.
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            # Also disable server-side function calling so the model never emits tool_call parts.
             tool_config=types.ToolConfig(
                 function_calling_config=types.FunctionCallingConfig(mode="NONE"),
             ),
@@ -688,6 +690,7 @@ def _auto_stop(indicator: Indicator):
 def _on_press(key, indicator: Indicator):
     global _active, _record_timer, _mods_held, _last_press_time
     try:
+        # Modifier keys: tracked freely, no debounce (required for ctrl+space timing).
         if key in _ALL_MOD_KEYS:
             _mods_held.add(key)
             return
@@ -695,23 +698,29 @@ def _on_press(key, indicator: Indicator):
         if key == _DICT_KEY and _DICT_MODS and bool(_DICT_MODS & _mods_held):
             threading.Thread(target=_add_from_clipboard, daemon=True).start()
             return
-        # Record hotkey (default ctrl+space): start PTT recording
+        # Non-record key: ignore
         if key != _RECORD_KEY:
             return
-        if _RECORD_MODS and not bool(_RECORD_MODS & _mods_held):
-            return
-        now = time.perf_counter()
-        log.debug("[KEY_DOWN] key=%s ts=%.3f", key, now)
+
+        # Record key confirmed. Acquire _lock BEFORE modifier-held check, debounce check,
+        # and state update — all three must be atomic.
+        # CRITICAL: now is computed INSIDE the lock so elapsed reflects queue order, not
+        # wall clock. If now were outside, start_recording()'s sounddevice init (~300ms)
+        # would inflate elapsed and let chatter events slip through the debounce gate.
         with _lock:
+            now = time.perf_counter()
+            if _RECORD_MODS and not bool(_RECORD_MODS & _mods_held):
+                return
             elapsed_ms = (now - _last_press_time) * 1000
             if elapsed_ms < _DEBOUNCE_MS:
-                log.debug("[KEY_DOWN] DEBOUNCED: %.1fms since last press (threshold %dms)",
-                          elapsed_ms, _DEBOUNCE_MS)
+                log.debug("[KEY_DOWN] DEBOUNCED: %.1fms (< %dms)", elapsed_ms, _DEBOUNCE_MS)
                 return
             if _active or _blocked_until_release or _pasting or _is_processing:
                 return
-            _active = True
+            _active = True          # Set atomically with _last_press_time — no second lock needed
             _last_press_time = now
+
+        log.debug("[KEY_DOWN] key=%s ts=%.3f", key, time.perf_counter())
         indicator.safe_set_state("recording")
         start_recording()
         _record_timer = threading.Timer(RECORD_MAX_SEC, _auto_stop, args=(indicator,))
